@@ -30,7 +30,23 @@ from cosmos_predict1.utils.io import read_prompts_from_file, save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Buffer
 from cosmos_predict1.diffusion.inference.camera_utils import generate_camera_trajectory
 import torch.nn.functional as F
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+import time
+from contextlib import contextmanager
 torch.enable_grad(False)
+
+@contextmanager
+def _timed(section: str):
+    t0 = time.perf_counter()
+    log.info(f"[TIMER] {section} | start")
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        log.info(f"[TIMER] {section} | end: {dt:.3f}s")
+
+def _now_perf() -> float:
+    return time.perf_counter()
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Video to world generation demo script")
@@ -100,6 +116,12 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If set, use foreground masking for the warped images.",
     )
+    parser.add_argument(
+        "--dad_model_id",
+        type=str,
+        default="xingyang1/Distill-Any-Depth-Large-hf",
+        help="Hugging Face model id for Distill-Any-Depth to replace MoGe depth",
+    )
     return parser
 
 def parse_arguments() -> argparse.Namespace:
@@ -111,15 +133,44 @@ def validate_args(args):
     assert args.num_video_frames is not None, "num_video_frames must be provided"
     assert (args.num_video_frames - 1) % 120 == 0, "num_video_frames must be 121, 241, 361, ... (N*120+1)"
 
+def _dad_predict_depth_hw_from_rgb_numpy(input_image_rgb: np.ndarray,
+                                         target_h: int,
+                                         target_w: int,
+                                         device: torch.device,
+                                         dad_processor: AutoImageProcessor,
+                                         dad_model: AutoModelForDepthEstimation) -> torch.Tensor:
+    """Run Distill-Any-Depth via Transformers, return float32 tensor (H, W) on device."""
+    with _timed("DAD infer (transformers)"):
+        inputs = dad_processor(images=[input_image_rgb], return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = dad_model(**inputs)
+        post = dad_processor.post_process_depth_estimation(outputs, target_sizes=[(target_h, target_w)])
+        depth_hw = post[0]["predicted_depth"].to(device).to(torch.float32)
+    return depth_hw
+
+def _rescale_depth_like_reference(dad_hw: torch.Tensor,
+                                  ref_hw: torch.Tensor,
+                                  ref_mask_hw: torch.Tensor | None) -> torch.Tensor:
+    """Rescale DAD depth to match the reference (MoGe) distribution using robust 5–95% percentiles."""
+    device = dad_hw.device
+    eps = torch.tensor(1e-6, device=device, dtype=torch.float32)
+    ref_vals = ref_hw[ref_mask_hw] if (ref_mask_hw is not None and ref_mask_hw.any()) else ref_hw.reshape(-1)
+    dad_vals = dad_hw.reshape(-1)
+    q_ref = torch.quantile(ref_vals, torch.tensor([0.05, 0.95], device=device))
+    q_dad = torch.quantile(dad_vals, torch.tensor([0.05, 0.95], device=device))
+    dad_norm = (dad_hw - q_dad[0]) / (q_dad[1] - q_dad[0] + eps)
+    dad_scaled = dad_norm * (q_ref[1] - q_ref[0]) + q_ref[0]
+    dad_scaled = torch.nan_to_num(dad_scaled, nan=1e4)
+    dad_scaled = torch.clamp(dad_scaled, min=0.0, max=1e4)
+    return dad_scaled
+
 def _predict_moge_depth(current_image_path: str | np.ndarray,
                         target_h: int, target_w: int,
-                        device: torch.device, moge_model: MoGeModel):
-    """Handles MoGe depth prediction for a single image.
-
-    If the image is directly provided as a NumPy array, it should have shape [H, W, C],
-    where the channels are RGB and the pixel values are in [0..255].
-    """
-
+                        device: torch.device, moge_model: MoGeModel,
+                        dad_processor: AutoImageProcessor,
+                        dad_model: AutoModelForDepthEstimation):
+    """Handles MoGe depth + intrinsics + mask + image, then REPLACES depth with DAD depth rescaled to MoGe."""
     if isinstance(current_image_path, str):
         input_image_bgr = cv2.imread(current_image_path)
         if input_image_bgr is None:
@@ -133,7 +184,8 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
 
     input_image_for_depth_resized = cv2.resize(input_image_rgb, (depth_pred_w, depth_pred_h))
     input_image_for_depth_tensor_chw = torch.tensor(input_image_for_depth_resized / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
-    moge_output_full = moge_model.infer(input_image_for_depth_tensor_chw)
+    with _timed("MoGe infer (initial)"):
+        moge_output_full = moge_model.infer(input_image_for_depth_tensor_chw)
     moge_depth_hw_full = moge_output_full["depth"]
     moge_intrinsics_33_full_normalized = moge_output_full["intrinsics"]
     moge_mask_hw_full = moge_output_full["mask"]
@@ -145,12 +197,9 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
     moge_intrinsics_33_full_pixel[0, 2] *= depth_pred_w
     moge_intrinsics_33_full_pixel[1, 2] *= depth_pred_h
 
-    # Calculate scaling factor for height
     height_scale_factor = target_h / depth_pred_h
     width_scale_factor = target_w / depth_pred_w
 
-    # Resize depth map, mask, and image tensor
-    # Resizing depth: (H, W) -> (1, 1, H, W) for interpolate, then squeeze
     moge_depth_hw = F.interpolate(
         moge_depth_hw_full.unsqueeze(0).unsqueeze(0),
         size=(target_h, target_w),
@@ -158,14 +207,12 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
         align_corners=False
     ).squeeze(0).squeeze(0)
 
-    # Resizing mask: (H, W) -> (1, 1, H, W) for interpolate, then squeeze
     moge_mask_hw = F.interpolate(
         moge_mask_hw_full.unsqueeze(0).unsqueeze(0).to(torch.float32),
         size=(target_h, target_w),
-        mode='nearest',  # Using nearest neighbor for binary mask
+        mode='nearest',
     ).squeeze(0).squeeze(0).to(torch.bool)
 
-    # Resizing image tensor: (C, H, W) -> (1, C, H, W) for interpolate, then squeeze
     input_image_tensor_chw_target_res = F.interpolate(
         input_image_for_depth_tensor_chw.unsqueeze(0),
         size=(target_h, target_w),
@@ -176,17 +223,19 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
     moge_image_b1chw_float = input_image_tensor_chw_target_res.unsqueeze(0).unsqueeze(1) * 2 - 1
 
     moge_intrinsics_33 = moge_intrinsics_33_full_pixel.clone()
-    # Adjust intrinsics for resized height
-    moge_intrinsics_33[1, 1] *= height_scale_factor  # fy
-    moge_intrinsics_33[1, 2] *= height_scale_factor  # cy
-    moge_intrinsics_33[0, 0] *= width_scale_factor  # fx
-    moge_intrinsics_33[0, 2] *= width_scale_factor  # cx
+    moge_intrinsics_33[1, 1] *= height_scale_factor
+    moge_intrinsics_33[1, 2] *= height_scale_factor
+    moge_intrinsics_33[0, 0] *= width_scale_factor
+    moge_intrinsics_33[0, 2] *= width_scale_factor
 
-    moge_depth_b11hw = moge_depth_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    dad_depth_hw = _dad_predict_depth_hw_from_rgb_numpy(input_image_rgb, target_h, target_w, device, dad_processor, dad_model)
+    dad_depth_hw = _rescale_depth_like_reference(dad_depth_hw, moge_depth_hw, moge_mask_hw)
+    dad_depth_hw = torch.where(moge_mask_hw==0, torch.tensor(1000.0, device=dad_depth_hw.device), dad_depth_hw)
+
+    moge_depth_b11hw = dad_depth_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
     moge_depth_b11hw = torch.nan_to_num(moge_depth_b11hw, nan=1e4)
     moge_depth_b11hw = torch.clamp(moge_depth_b11hw, min=0, max=1e4)
     moge_mask_b11hw = moge_mask_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    # Prepare initial intrinsics [B, 1, 3, 3]
     moge_intrinsics_b133 = moge_intrinsics_33.unsqueeze(0).unsqueeze(0)
     initial_w2c_44 = torch.eye(4, dtype=torch.float32, device=device)
     moge_initial_w2c_b144 = initial_w2c_44.unsqueeze(0).unsqueeze(0)
@@ -201,12 +250,15 @@ def _predict_moge_depth(current_image_path: str | np.ndarray,
 
 def _predict_moge_depth_from_tensor(
     image_tensor_chw_0_1: torch.Tensor, # Shape (C, H_input, W_input), range [0,1]
-    moge_model: MoGeModel
+    moge_model: MoGeModel,
+    dad_processor: AutoImageProcessor,
+    dad_model: AutoModelForDepthEstimation
 ):
-    """Handles MoGe depth prediction from an image tensor."""
-    moge_output_full = moge_model.infer(image_tensor_chw_0_1)
-    moge_depth_hw_full = moge_output_full["depth"]      # (moge_inf_h, moge_inf_w)
-    moge_mask_hw_full = moge_output_full["mask"]        # (moge_inf_h, moge_inf_w)
+    """Run MoGe to get reference stats, then REPLACE depth with DAD predicted depth, rescaled to MoGe."""
+    with _timed("MoGe infer (AR frame)"):
+        moge_output_full = moge_model.infer(image_tensor_chw_0_1)
+    moge_depth_hw_full = moge_output_full["depth"]
+    moge_mask_hw_full = moge_output_full["mask"]
 
     moge_depth_11hw = moge_depth_hw_full.unsqueeze(0).unsqueeze(0)
     moge_depth_11hw = torch.nan_to_num(moge_depth_11hw, nan=1e4)
@@ -214,7 +266,15 @@ def _predict_moge_depth_from_tensor(
     moge_mask_11hw = moge_mask_hw_full.unsqueeze(0).unsqueeze(0)
     moge_depth_11hw = torch.where(moge_mask_11hw==0, torch.tensor(1000.0, device=moge_depth_11hw.device), moge_depth_11hw)
 
-    return moge_depth_11hw, moge_mask_11hw
+    with torch.no_grad():
+        img_uint8 = (image_tensor_chw_0_1.clamp(0,1).permute(1,2,0) * 255.0).round().to(torch.uint8).cpu().numpy()
+    target_h, target_w = int(image_tensor_chw_0_1.shape[1]), int(image_tensor_chw_0_1.shape[2])
+    dad_depth_hw = _dad_predict_depth_hw_from_rgb_numpy(img_uint8, target_h, target_w, image_tensor_chw_0_1.device, dad_processor, dad_model)
+    dad_depth_hw = _rescale_depth_like_reference(dad_depth_hw, moge_depth_11hw.squeeze(0).squeeze(0), moge_mask_11hw.squeeze(0).squeeze(0).to(torch.bool))
+    dad_depth_hw = torch.where(moge_mask_11hw.squeeze(0).squeeze(0)==0, torch.tensor(1000.0, device=dad_depth_hw.device), dad_depth_hw)
+    dad_depth_11hw = dad_depth_hw.unsqueeze(0).unsqueeze(0)
+
+    return dad_depth_11hw, moge_mask_11hw
 
 def demo(args):
     """Run video-to-world generation demo.
@@ -240,61 +300,74 @@ def demo(args):
     If guardrails block the generation, a critical log message is displayed
     and the function continues to the next prompt if available.
     """
+    t_total_start = _now_perf()
     misc.set_random_seed(args.seed)
     inference_type = "video2world"
     validate_args(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Runtime device: {device}, CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        try:
+            log.info(f"CUDA device 0: {torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
+    log.info(f"Args snapshot: {args}")
 
     if args.num_gpus > 1:
         from megatron.core import parallel_state
 
         from cosmos_predict1.utils import distributed
 
-        distributed.init()
-        parallel_state.initialize_model_parallel(context_parallel_size=args.num_gpus)
-        process_group = parallel_state.get_context_parallel_group()
+        with _timed("Distributed init"):
+            distributed.init()
+            parallel_state.initialize_model_parallel(context_parallel_size=args.num_gpus)
+            process_group = parallel_state.get_context_parallel_group()
 
-    # Initialize video2world generation model pipeline
-    pipeline = Gen3cPipeline(
-        inference_type=inference_type,
-        checkpoint_dir=args.checkpoint_dir,
-        checkpoint_name="Gen3C-Cosmos-7B",
-        prompt_upsampler_dir=args.prompt_upsampler_dir,
-        enable_prompt_upsampler=not args.disable_prompt_upsampler,
-        offload_network=args.offload_diffusion_transformer,
-        offload_tokenizer=args.offload_tokenizer,
-        offload_text_encoder_model=args.offload_text_encoder_model,
-        offload_prompt_upsampler=args.offload_prompt_upsampler,
-        offload_guardrail_models=args.offload_guardrail_models,
-        disable_guardrail=args.disable_guardrail,
-        disable_prompt_encoder=args.disable_prompt_encoder,
-        guidance=args.guidance,
-        num_steps=args.num_steps,
-        height=args.height,
-        width=args.width,
-        fps=args.fps,
-        num_video_frames=121,
-        seed=args.seed,
-    )
+    with _timed("Init Gen3cPipeline"):
+        pipeline = Gen3cPipeline(
+            inference_type=inference_type,
+            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_name="Gen3C-Cosmos-7B",
+            prompt_upsampler_dir=args.prompt_upsampler_dir,
+            enable_prompt_upsampler=not args.disable_prompt_upsampler,
+            offload_network=args.offload_diffusion_transformer,
+            offload_tokenizer=args.offload_tokenizer,
+            offload_text_encoder_model=args.offload_text_encoder_model,
+            offload_prompt_upsampler=args.offload_prompt_upsampler,
+            offload_guardrail_models=args.offload_guardrail_models,
+            disable_guardrail=args.disable_guardrail,
+            disable_prompt_encoder=args.disable_prompt_encoder,
+            guidance=args.guidance,
+            num_steps=args.num_steps,
+            height=args.height,
+            width=args.width,
+            fps=args.fps,
+            num_video_frames=121,
+            seed=args.seed,
+        )
 
     frame_buffer_max = pipeline.model.frame_buffer_max
     generator = torch.Generator(device=device).manual_seed(args.seed)
     sample_n_frames = pipeline.model.chunk_size
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+
+    with _timed("Load MoGe"):
+        moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
+    with _timed(f"Load DAD model ({'cpu' if device.type=='cpu' else 'cuda'})"):
+        dad_processor = AutoImageProcessor.from_pretrained(args.dad_model_id)
+        dad_model = AutoModelForDepthEstimation.from_pretrained(args.dad_model_id).to(device).eval()
 
     if args.num_gpus > 1:
         pipeline.model.net.enable_context_parallel(process_group)
 
-    # Handle multiple prompts if prompt file is provided
     if args.batch_input_path:
         log.info(f"Reading batch inputs from path: {args.batch_input_path}")
         prompts = read_prompts_from_file(args.batch_input_path)
     else:
-        # Single prompt case
         prompts = [{"prompt": args.prompt, "visual_input": args.input_image_path}]
 
     os.makedirs(os.path.dirname(args.video_save_folder), exist_ok=True)
     for i, input_dict in enumerate(prompts):
+        t_item_start = _now_perf()
         current_prompt = input_dict.get("prompt", None)
         if current_prompt is None and args.disable_prompt_upsampler:
             log.critical("Prompt is missing, skipping world generation.")
@@ -304,72 +377,74 @@ def demo(args):
             log.critical("Visual input is missing, skipping world generation.")
             continue
 
-        # Check input frames
+        log.info(f"Item {i}: input={current_image_path}, movement={args.movement_distance}, frames={args.num_video_frames}, chunk={sample_n_frames}, guidance={args.guidance}")
+
         if not check_input_frames(current_image_path, 1):
             print(f"Input image {current_image_path} is not valid, skipping.")
             continue
 
-        # load image, predict depth and initialize 3D cache
-        (
-            moge_image_b1chw_float,
-            moge_depth_b11hw,
-            moge_mask_b11hw,
-            moge_initial_w2c_b144,
-            moge_intrinsics_b133,
-        ) = _predict_moge_depth(
-            current_image_path, args.height, args.width, device, moge_model
-        )
+        with _timed("Depth+intrinsics init (MoGe+DAD)"):
+            (
+                moge_image_b1chw_float,
+                moge_depth_b11hw,
+                moge_mask_b11hw,
+                moge_initial_w2c_b144,
+                moge_intrinsics_b133,
+            ) = _predict_moge_depth(
+                current_image_path, args.height, args.width, device, moge_model, dad_processor, dad_model
+            )
 
-        cache = Cache3D_Buffer(
-            frame_buffer_max=frame_buffer_max,
-            generator=generator,
-            noise_aug_strength=args.noise_aug_strength,
-            input_image=moge_image_b1chw_float[:, 0].clone(), # [B, C, H, W]
-            input_depth=moge_depth_b11hw[:, 0],       # [B, 1, H, W]
-            # input_mask=moge_mask_b11hw[:, 0],         # [B, 1, H, W]
-            input_w2c=moge_initial_w2c_b144[:, 0],  # [B, 4, 4]
-            input_intrinsics=moge_intrinsics_b133[:, 0],# [B, 3, 3]
-            filter_points_threshold=args.filter_points_threshold,
-            foreground_masking=args.foreground_masking,
-        )
+        with _timed("Cache3D init"):
+            cache = Cache3D_Buffer(
+                frame_buffer_max=frame_buffer_max,
+                generator=generator,
+                noise_aug_strength=args.noise_aug_strength,
+                input_image=moge_image_b1chw_float[:, 0].clone(),
+                input_depth=moge_depth_b11hw[:, 0],
+                # input_mask=moge_mask_b11hw[:, 0],
+                input_w2c=moge_initial_w2c_b144[:, 0],
+                input_intrinsics=moge_intrinsics_b133[:, 0],
+                filter_points_threshold=args.filter_points_threshold,
+                foreground_masking=args.foreground_masking,
+            )
 
         initial_cam_w2c_for_traj = moge_initial_w2c_b144[0, 0]
         initial_cam_intrinsics_for_traj = moge_intrinsics_b133[0, 0]
 
-        # Generate camera trajectory using the new utility function
         try:
-            generated_w2cs, generated_intrinsics = generate_camera_trajectory(
-                trajectory_type=args.trajectory,
-                initial_w2c=initial_cam_w2c_for_traj,
-                initial_intrinsics=initial_cam_intrinsics_for_traj,
-                num_frames=args.num_video_frames,
-                movement_distance=args.movement_distance,
-                camera_rotation=args.camera_rotation,
-                center_depth=1.0,
-                device=device.type,
-            )
+            with _timed("Trajectory generation"):
+                generated_w2cs, generated_intrinsics = generate_camera_trajectory(
+                    trajectory_type=args.trajectory,
+                    initial_w2c=initial_cam_w2c_for_traj,
+                    initial_intrinsics=initial_cam_intrinsics_for_traj,
+                    num_frames=args.num_video_frames,
+                    movement_distance=args.movement_distance,
+                    camera_rotation=args.camera_rotation,
+                    center_depth=1.0,
+                    device=device.type,
+                )
         except (ValueError, NotImplementedError) as e:
             log.critical(f"Failed to generate trajectory: {e}")
             continue
 
-        log.info(f"Generating 0 - {sample_n_frames} frames")
-        rendered_warp_images, rendered_warp_masks = cache.render_cache(
-            generated_w2cs[:, 0:sample_n_frames],
-            generated_intrinsics[:, 0:sample_n_frames],
-        )
+        with _timed(f"Render cache [0:{sample_n_frames}]"):
+            rendered_warp_images, rendered_warp_masks = cache.render_cache(
+                generated_w2cs[:, 0:sample_n_frames],
+                generated_intrinsics[:, 0:sample_n_frames],
+            )
 
         all_rendered_warps = []
         if args.save_buffer:
             all_rendered_warps.append(rendered_warp_images.clone().cpu())
 
-        # Generate video
-        generated_output = pipeline.generate(
-            prompt=current_prompt,
-            image_path=current_image_path,
-            negative_prompt=args.negative_prompt,
-            rendered_warp_images=rendered_warp_images,
-            rendered_warp_masks=rendered_warp_masks,
-        )
+        with _timed(f"Pipeline.generate [0:{sample_n_frames}]"):
+            generated_output = pipeline.generate(
+                prompt=current_prompt,
+                image_path=current_image_path,
+                negative_prompt=args.negative_prompt,
+                rendered_warp_images=rendered_warp_images,
+                rendered_warp_masks=rendered_warp_masks,
+            )
         if generated_output is None:
             log.critical("Guardrail blocked video2world generation.")
             continue
@@ -377,68 +452,69 @@ def demo(args):
 
         num_ar_iterations = (generated_w2cs.shape[1] - 1) // (sample_n_frames - 1)
         for num_iter in range(1, num_ar_iterations):
-            start_frame_idx = num_iter * (sample_n_frames - 1) # Overlap by 1 frame
+            start_frame_idx = num_iter * (sample_n_frames - 1)
             end_frame_idx = start_frame_idx + sample_n_frames
 
-            log.info(f"Generating {start_frame_idx} - {end_frame_idx} frames")
+            log.info(f"Autoregressive pass {num_iter}/{num_ar_iterations-1}: frames [{start_frame_idx}:{end_frame_idx}]")
 
             last_frame_hwc_0_255 = torch.tensor(video[-1], device=device)
-            pred_image_for_depth_chw_0_1 = last_frame_hwc_0_255.permute(2, 0, 1) / 255.0 # (C,H,W), range [0,1]
+            pred_image_for_depth_chw_0_1 = last_frame_hwc_0_255.permute(2, 0, 1) / 255.0
 
-            pred_depth, pred_mask = _predict_moge_depth_from_tensor(
-                pred_image_for_depth_chw_0_1, moge_model
-            )
+            with _timed("Depth predict (AR MoGe+DAD replace)"):
+                pred_depth, pred_mask = _predict_moge_depth_from_tensor(
+                    pred_image_for_depth_chw_0_1, moge_model, dad_processor, dad_model
+                )
 
-            cache.update_cache(
-                new_image=pred_image_for_depth_chw_0_1.unsqueeze(0) * 2 - 1, # (B,C,H,W) range [-1,1]
-                new_depth=pred_depth, #  (1,1,H,W)
-                # new_mask=pred_mask,   # (1,1,H,W)
-                new_w2c=generated_w2cs[:, start_frame_idx],
-                new_intrinsics=generated_intrinsics[:, start_frame_idx],
-            )
+            with _timed("Cache3D update"):
+                cache.update_cache(
+                    new_image=pred_image_for_depth_chw_0_1.unsqueeze(0) * 2 - 1,
+                    new_depth=pred_depth,
+                    # new_mask=pred_mask,
+                    new_w2c=generated_w2cs[:, start_frame_idx],
+                    new_intrinsics=generated_intrinsics[:, start_frame_idx],
+                )
             current_segment_w2cs = generated_w2cs[:, start_frame_idx:end_frame_idx]
             current_segment_intrinsics = generated_intrinsics[:, start_frame_idx:end_frame_idx]
-            rendered_warp_images, rendered_warp_masks = cache.render_cache(
-                current_segment_w2cs,
-                current_segment_intrinsics,
-            )
+            with _timed(f"Render cache [{start_frame_idx}:{end_frame_idx}]"):
+                rendered_warp_images, rendered_warp_masks = cache.render_cache(
+                    current_segment_w2cs,
+                    current_segment_intrinsics,
+                )
 
             if args.save_buffer:
                 all_rendered_warps.append(rendered_warp_images[:, 1:].clone().cpu())
 
-
-            pred_image_for_depth_bcthw_minus1_1 = pred_image_for_depth_chw_0_1.unsqueeze(0).unsqueeze(2) * 2 - 1 # (B,C,T,H,W), range [-1,1]
-            generated_output = pipeline.generate(
-                prompt=current_prompt,
-                image_path=pred_image_for_depth_bcthw_minus1_1,
-                negative_prompt=args.negative_prompt,
-                rendered_warp_images=rendered_warp_images,
-                rendered_warp_masks=rendered_warp_masks,
-            )
+            pred_image_for_depth_bcthw_minus1_1 = pred_image_for_depth_chw_0_1.unsqueeze(0).unsqueeze(2) * 2 - 1
+            with _timed(f"Pipeline.generate [{start_frame_idx}:{end_frame_idx}]"):
+                generated_output = pipeline.generate(
+                    prompt=current_prompt,
+                    image_path=pred_image_for_depth_bcthw_minus1_1,
+                    negative_prompt=args.negative_prompt,
+                    rendered_warp_images=rendered_warp_images,
+                    rendered_warp_masks=rendered_warp_masks,
+                )
             video_new, prompt = generated_output
             video = np.concatenate([video, video_new[1:]], axis=0)
 
-        # Final video processing
         final_video_to_save = video
         final_width = args.width
 
         if args.save_buffer and all_rendered_warps:
-            squeezed_warps = [t.squeeze(0) for t in all_rendered_warps] # Each is (T_chunk, n_i, C, H, W)
+            squeezed_warps = [t.squeeze(0) for t in all_rendered_warps]
 
             if squeezed_warps:
                 n_max = max(t.shape[1] for t in squeezed_warps)
 
                 padded_t_list = []
                 for sq_t in squeezed_warps:
-                    # sq_t shape: (T_chunk, n_i, C, H, W)
                     current_n_i = sq_t.shape[1]
                     padding_needed_dim1 = n_max - current_n_i
 
-                    pad_spec = (0,0, # W
-                                0,0, # H
-                                0,0, # C
-                                0,padding_needed_dim1, # n_i
-                                0,0) # T_chunk
+                    pad_spec = (0,0,
+                                0,0,
+                                0,0,
+                                0,padding_needed_dim1,
+                                0,0)
                     padded_t = F.pad(sq_t, pad_spec, mode='constant', value=-1.0)
                     padded_t_list.append(padded_t)
 
@@ -457,7 +533,6 @@ def demo(args):
             else:
                 log.info("No warp buffers to save.")
 
-
         video_save_path = os.path.join(
             args.video_save_folder,
             f"{i if args.batch_input_path else args.video_save_name}.mp4"
@@ -465,23 +540,25 @@ def demo(args):
 
         os.makedirs(os.path.dirname(video_save_path), exist_ok=True)
 
-        # Save video
-        save_video(
-            video=final_video_to_save,
-            fps=args.fps,
-            H=args.height,
-            W=final_width,
-            video_save_quality=5,
-            video_save_path=video_save_path,
-        )
+        with _timed("Save video"):
+            save_video(
+                video=final_video_to_save,
+                fps=args.fps,
+                H=args.height,
+                W=final_width,
+                video_save_quality=5,
+                video_save_path=video_save_path,
+            )
         log.info(f"Saved video to {video_save_path}")
+        log.info(f"Item {i} total elapsed: {(time.perf_counter() - t_item_start):.3f}s")
 
-    # clean up properly
     if args.num_gpus > 1:
         parallel_state.destroy_model_parallel()
         import torch.distributed as dist
 
         dist.destroy_process_group()
+
+    log.info(f"Overall elapsed: {(time.perf_counter() - t_total_start):.3f}s")
 
 
 if __name__ == "__main__":
