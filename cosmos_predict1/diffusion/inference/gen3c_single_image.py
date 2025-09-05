@@ -403,7 +403,7 @@ def demo(args):
         if generated_output is None:
             log.critical("Guardrail blocked generation.")
             continue
-        video, prompt_text = generated_output  # (T, H, W, 3) uint8
+        video, prompt_text = generated_output  # video: (T, H, W, 3) uint8
 
         # Autoregressive passes
         num_ar_iterations = (generated_w2cs.shape[1] - 1) // (sample_n_frames - 1)
@@ -419,7 +419,7 @@ def demo(args):
             with _timed("MoGe depth predict (AR)"):
                 pred_depth_11, pred_mask_11 = _predict_moge_depth_from_image_tensor(frame_chw_0_1, moge_model)
 
-            # Optional save AR depth/mask
+            # Optional save AR depth/mask (use the timeline index where this frame lands)
             if args.save_depth_dir:
                 _save_depth_png16(
                     pred_depth_11[0, 0], pred_mask_11[0, 0],
@@ -511,37 +511,44 @@ def demo(args):
             )
         log.info(f"Saved video to {video_save_path}")
 
-        # Save the conditioning ("input") video if requested — FIXED
+        # Save the conditioning ("input") video if requested.
+        # IMPORTANT: This block logs and continues on ANY failure.
         if args.save_conditioning_video and conditioning_chunks:
-            # Concatenate along time dimension; first chunk keeps all frames, others drop overlap
-            cond = torch.cat(conditioning_chunks, dim=1)            # (B=1, T, C=3, H, W)
+            try:
+                for idx, t in enumerate(conditioning_chunks):
+                    log.info(f"[COND] chunk[{idx}] dtype={t.dtype} device={t.device} shape={tuple(t.shape)}")
 
-            # Some backends may return sparse tensors; convert to dense before permute/reshape.
-            if cond.is_sparse:
-                cond = cond.to_dense()
+                # Concatenate along time dimension; first chunk keeps all frames, others dropped overlap already
+                cond = torch.cat(conditioning_chunks, dim=1)  # expected ~ (B, T, C, H, W)
+                log.info(f"[COND] stitched shape before reshape: {tuple(cond.shape)}; dtype={cond.dtype}; device={cond.device}")
 
-            # Permute 5 dims first, then flatten (B,T,H,W,C) -> (B*T, H, W, C)
-            B, T, C, H, W = cond.shape
-            cond_THWC = ((cond.permute(0, 1, 3, 4, 2)  # (B,T,H,W,C)
-                              .reshape(B * T, H, W, C) * 0.5 + 0.5)
+                # Robust reshape: collapse ALL leading dims into T, keep (C,H,W) as the last three dims.
+                if cond.dim() < 4:
+                    raise RuntimeError(f"Conditioning tensor has too few dims: {cond.dim()} (shape={tuple(cond.shape)})")
+
+                C, H, W = int(cond.shape[-3]), int(cond.shape[-2]), int(cond.shape[-1])
+                N = int(np.prod(cond.shape[:-3]))  # total frames after flattening all leading dims
+                cond_NCHW = cond.reshape(N, C, H, W)
+                log.info(f"[COND] after reshape to (N,C,H,W): {tuple(cond_NCHW.shape)}")
+
+                cond_THWC = ((cond_NCHW.permute(0, 2, 3, 1).float() * 0.5 + 0.5)
                               * 255.0).clamp(0, 255).byte().cpu().numpy()
+                log.info(f"[COND] final THWC array shape: {cond_THWC.shape}")
 
-            # Ensure .mp4 extension even if a stem was provided
-            name = args.conditioning_video_name
-            if not name.lower().endswith(".mp4"):
-                name += ".mp4"
-            cond_path = os.path.join(args.video_save_folder, name)
-
-            with _timed("Save conditioning video"):
-                save_video(
-                    video=cond_THWC,
-                    fps=args.fps,
-                    H=args.height,
-                    W=args.width,
-                    video_save_quality=5,
-                    video_save_path=cond_path,
-                )
-            log.info(f"Saved conditioning video to {cond_path}")
+                cond_path = os.path.join(args.video_save_folder, args.conditioning_video_name)
+                with _timed("Save conditioning video"):
+                    save_video(
+                        video=cond_THWC,
+                        fps=args.fps,
+                        H=args.height,
+                        W=args.width,
+                        video_save_quality=5,
+                        video_save_path=cond_path,
+                    )
+                log.info(f"Saved conditioning video to {cond_path}")
+            except Exception as e:
+                # Do not fail the whole run if conditioning video save fails.
+                log.exception(f"[COND] Failed to save conditioning video; continuing without it. Error: {e}")
 
         log.info(f"Item {i} total elapsed: {(time.perf_counter() - t_item_start):.3f}s")
 
