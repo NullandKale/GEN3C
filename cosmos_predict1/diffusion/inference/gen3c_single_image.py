@@ -5,7 +5,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,7 +22,6 @@ import numpy as np
 from cosmos_predict1.diffusion.inference.inference_utils import (
     add_common_arguments,
     check_input_frames,
-    validate_args,
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
 from cosmos_predict1.utils import log, misc
@@ -30,11 +29,14 @@ from cosmos_predict1.utils.io import read_prompts_from_file, save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Buffer
 from cosmos_predict1.diffusion.inference.camera_utils import generate_camera_trajectory
 import torch.nn.functional as F
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 import time
 from contextlib import contextmanager
+
 torch.enable_grad(False)
 
+# ----------------------------
+# Utilities
+# ----------------------------
 @contextmanager
 def _timed(section: str):
     t0 = time.perf_counter()
@@ -48,262 +50,210 @@ def _timed(section: str):
 def _now_perf() -> float:
     return time.perf_counter()
 
+def _ensure_dir(d: str | None):
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def _save_mask_png(mask_hw_bool: torch.Tensor, out_path: str):
+    """Save a binary mask (H, W) as 8-bit PNG (0 or 255)."""
+    mask_u8 = (mask_hw_bool.to(torch.uint8) * 255).cpu().numpy()
+    cv2.imwrite(out_path, mask_u8)
+
+def _save_depth_png16(depth_hw: torch.Tensor,
+                      valid_mask_hw: torch.Tensor | None,
+                      out_path: str,
+                      q_lo: float = 0.01,
+                      q_hi: float = 0.99):
+    """
+    Save depth (H, W, float32) as a 16-bit single-channel PNG using robust
+    percentile normalization over valid pixels.
+    """
+    d = depth_hw
+    if valid_mask_hw is None:
+        valid_mask_hw = torch.isfinite(d) & (d < 9.99e3)
+
+    if not torch.any(valid_mask_hw):
+        # Fallback: zeros
+        arr = torch.zeros_like(d, dtype=torch.uint16).cpu().numpy()
+        cv2.imwrite(out_path, arr)
+        return
+
+    vals = d[valid_mask_hw]
+    lo = torch.quantile(vals, torch.tensor(q_lo, device=d.device))
+    hi = torch.quantile(vals, torch.tensor(q_hi, device=d.device))
+    scale = 65535.0 / max((hi - lo).item(), 1e-6)
+    d16 = ((d - lo) * scale).clamp(0, 65535).to(torch.uint16).cpu().numpy()
+    cv2.imwrite(out_path, d16)
+
+# ----------------------------
+# Args
+# ----------------------------
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Video to world generation demo script")
-    # Add common arguments
+    parser = argparse.ArgumentParser(description="Image-to-video (video-to-world) demo script")
+
+    # Common project args
     add_common_arguments(parser)
 
-    parser.add_argument(
-        "--prompt_upsampler_dir",
-        type=str,
-        default="Pixtral-12B",
-        help="Prompt upsampler weights directory relative to checkpoint_dir",
-    ) # TODO: do we need this?
-    parser.add_argument(
-        "--input_image_path",
-        type=str,
-        help="Input image path for generating a single video",
-    )
-    parser.add_argument(
-        "--trajectory",
-        type=str,
-        choices=[
-            "left",
-            "right",
-            "up",
-            "down",
-            "zoom_in",
-            "zoom_out",
-            "clockwise",
-            "counterclockwise",
-            "none",
-        ],
-        default="left",
-        help="Select a trajectory type from the available options (default: original)",
-    )
-    parser.add_argument(
-        "--camera_rotation",
-        type=str,
-        choices=["center_facing", "no_rotation", "trajectory_aligned"],
-        default="center_facing",
-        help="Controls camera rotation during movement: center_facing (rotate to look at center), no_rotation (keep orientation), or trajectory_aligned (rotate in the direction of movement)",
-    )
-    parser.add_argument(
-        "--movement_distance",
-        type=float,
-        default=0.3,
-        help="Distance of the camera from the center of the scene",
-    )
-    parser.add_argument(
-        "--noise_aug_strength",
-        type=float,
-        default=0.0,
-        help="Strength of noise augmentation on warped frames",
-    )
-    parser.add_argument(
-        "--save_buffer",
-        action="store_true",
-        help="If set, save the warped images (buffer) side by side with the output video.",
-    )
-    parser.add_argument(
-        "--filter_points_threshold",
-        type=float,
-        default=0.05,
-        help="If set, filter the points continuity of the warped images.",
-    )
-    parser.add_argument(
-        "--foreground_masking",
-        action="store_true",
-        help="If set, use foreground masking for the warped images.",
-    )
-    parser.add_argument(
-        "--dad_model_id",
-        type=str,
-        default="xingyang1/Distill-Any-Depth-Large-hf",
-        help="Hugging Face model id for Distill-Any-Depth to replace MoGe depth",
-    )
+    parser.add_argument("--prompt_upsampler_dir", type=str, default="Pixtral-12B",
+                        help="Prompt upsampler weights directory relative to checkpoint_dir")
+    parser.add_argument("--input_image_path", type=str,
+                        help="Input image path for generating a single video")
+
+    parser.add_argument("--trajectory", type=str,
+                        choices=["left", "right", "up", "down",
+                                 "zoom_in", "zoom_out", "clockwise", "counterclockwise", "none"],
+                        default="left",
+                        help="Camera path for synthetic motion.")
+    parser.add_argument("--camera_rotation", type=str,
+                        choices=["center_facing", "no_rotation", "trajectory_aligned"],
+                        default="center_facing",
+                        help="Rotation behavior during movement.")
+    parser.add_argument("--movement_distance", type=float, default=0.3,
+                        help="Distance of the camera from the scene center.")
+    parser.add_argument("--noise_aug_strength", type=float, default=0.0,
+                        help="Noise augmentation on warped frames.")
+    parser.add_argument("--save_buffer", action="store_true",
+                        help="If set, show rendered warp buffers side-by-side with output video.")
+    parser.add_argument("--filter_points_threshold", type=float, default=0.05,
+                        help="Filter threshold for point continuity in warps.")
+    parser.add_argument("--foreground_masking", action="store_true",
+                        help="Use foreground masking for warps.")
+
+    # New outputs
+    parser.add_argument("--save_depth_dir", type=str, default=None,
+                        help="If set, saves depth PNG16 frames here (e.g., outputs/depth).")
+    parser.add_argument("--save_mask_dir", type=str, default=None,
+                        help="If set, saves mask PNG frames here (e.g., outputs/mask).")
+    parser.add_argument("--save_conditioning_video", action="store_true",
+                        help="If set, saves the camera-warped conditioning sequence as MP4.")
+    parser.add_argument("--conditioning_video_name", type=str, default="input_conditioning.mp4",
+                        help="Filename for the conditioning MP4 (in video_save_folder).")
+
     return parser
 
 def parse_arguments() -> argparse.Namespace:
     parser = create_parser()
     return parser.parse_args()
 
-
 def validate_args(args):
     assert args.num_video_frames is not None, "num_video_frames must be provided"
     assert (args.num_video_frames - 1) % 120 == 0, "num_video_frames must be 121, 241, 361, ... (N*120+1)"
 
-def _dad_predict_depth_hw_from_rgb_numpy(input_image_rgb: np.ndarray,
-                                         target_h: int,
-                                         target_w: int,
-                                         device: torch.device,
-                                         dad_processor: AutoImageProcessor,
-                                         dad_model: AutoModelForDepthEstimation) -> torch.Tensor:
-    """Run Distill-Any-Depth via Transformers, return float32 tensor (H, W) on device."""
-    with _timed("DAD infer (transformers)"):
-        inputs = dad_processor(images=[input_image_rgb], return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = dad_model(**inputs)
-        post = dad_processor.post_process_depth_estimation(outputs, target_sizes=[(target_h, target_w)])
-        depth_hw = post[0]["predicted_depth"].to(device).to(torch.float32)
-    return depth_hw
-
-def _rescale_depth_like_reference(dad_hw: torch.Tensor,
-                                  ref_hw: torch.Tensor,
-                                  ref_mask_hw: torch.Tensor | None) -> torch.Tensor:
-    """Rescale DAD depth to match the reference (MoGe) distribution using robust 5–95% percentiles."""
-    device = dad_hw.device
-    eps = torch.tensor(1e-6, device=device, dtype=torch.float32)
-    ref_vals = ref_hw[ref_mask_hw] if (ref_mask_hw is not None and ref_mask_hw.any()) else ref_hw.reshape(-1)
-    dad_vals = dad_hw.reshape(-1)
-    q_ref = torch.quantile(ref_vals, torch.tensor([0.05, 0.95], device=device))
-    q_dad = torch.quantile(dad_vals, torch.tensor([0.05, 0.95], device=device))
-    dad_norm = (dad_hw - q_dad[0]) / (q_dad[1] - q_dad[0] + eps)
-    dad_scaled = dad_norm * (q_ref[1] - q_ref[0]) + q_ref[0]
-    dad_scaled = torch.nan_to_num(dad_scaled, nan=1e4)
-    dad_scaled = torch.clamp(dad_scaled, min=0.0, max=1e4)
-    return dad_scaled
-
-def _predict_moge_depth(current_image_path: str | np.ndarray,
-                        target_h: int, target_w: int,
-                        device: torch.device, moge_model: MoGeModel,
-                        dad_processor: AutoImageProcessor,
-                        dad_model: AutoModelForDepthEstimation):
-    """Handles MoGe depth + intrinsics + mask + image, then REPLACES depth with DAD depth rescaled to MoGe."""
-    if isinstance(current_image_path, str):
-        input_image_bgr = cv2.imread(current_image_path)
-        if input_image_bgr is None:
-            raise FileNotFoundError(f"Input image not found: {current_image_path}")
-        input_image_rgb = cv2.cvtColor(input_image_bgr, cv2.COLOR_BGR2RGB)
+# ----------------------------
+# Depth/Intrinsics via MoGe (no DAD)
+# ----------------------------
+def _predict_moge_depth_intrinsics(
+    current_image_path_or_rgb: str | np.ndarray,
+    target_h: int,
+    target_w: int,
+    device: torch.device,
+    moge_model: MoGeModel
+):
+    """
+    Run MoGe to get depth, intrinsics, mask and a resized/normalized image tensor.
+    Returns:
+        - image_b1chw_float in [-1, 1]
+        - depth_b11hw (meters-ish, clamped)
+        - mask_b11hw (bool-like)
+        - initial_w2c_b144 (eye)
+        - intrinsics_b133 (pixel units, resized)
+    """
+    # Load image
+    if isinstance(current_image_path_or_rgb, str):
+        input_bgr = cv2.imread(current_image_path_or_rgb)
+        if input_bgr is None:
+            raise FileNotFoundError(f"Input image not found: {current_image_path_or_rgb}")
+        input_rgb = cv2.cvtColor(input_bgr, cv2.COLOR_BGR2RGB)
     else:
-        input_image_rgb = current_image_path
-    del current_image_path
+        input_rgb = current_image_path_or_rgb
+    del current_image_path_or_rgb
 
+    # MoGe expects 1280x720 internally
     depth_pred_h, depth_pred_w = 720, 1280
 
-    input_image_for_depth_resized = cv2.resize(input_image_rgb, (depth_pred_w, depth_pred_h))
-    input_image_for_depth_tensor_chw = torch.tensor(input_image_for_depth_resized / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
-    with _timed("MoGe infer (initial)"):
-        moge_output_full = moge_model.infer(input_image_for_depth_tensor_chw)
-    moge_depth_hw_full = moge_output_full["depth"]
-    moge_intrinsics_33_full_normalized = moge_output_full["intrinsics"]
-    moge_mask_hw_full = moge_output_full["mask"]
+    # Prepare tensor for MoGe
+    img_resized = cv2.resize(input_rgb, (depth_pred_w, depth_pred_h))
+    img_chw_0_1 = torch.tensor(img_resized / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
 
-    moge_depth_hw_full = torch.where(moge_mask_hw_full==0, torch.tensor(1000.0, device=moge_depth_hw_full.device), moge_depth_hw_full)
-    moge_intrinsics_33_full_pixel = moge_intrinsics_33_full_normalized.clone()
-    moge_intrinsics_33_full_pixel[0, 0] *= depth_pred_w
-    moge_intrinsics_33_full_pixel[1, 1] *= depth_pred_h
-    moge_intrinsics_33_full_pixel[0, 2] *= depth_pred_w
-    moge_intrinsics_33_full_pixel[1, 2] *= depth_pred_h
+    with _timed("MoGe infer"):
+        moge_out = moge_model.infer(img_chw_0_1)
 
-    height_scale_factor = target_h / depth_pred_h
-    width_scale_factor = target_w / depth_pred_w
+    depth_hw_full = moge_out["depth"]                  # (H, W)
+    intrinsics_33_full_norm = moge_out["intrinsics"]   # normalized
+    mask_hw_full = moge_out["mask"]                    # 0/1
 
-    moge_depth_hw = F.interpolate(
-        moge_depth_hw_full.unsqueeze(0).unsqueeze(0),
-        size=(target_h, target_w),
-        mode='bilinear',
-        align_corners=False
-    ).squeeze(0).squeeze(0)
+    # Replace invalid with large sentinel
+    depth_hw_full = torch.where(mask_hw_full == 0, torch.tensor(1000.0, device=depth_hw_full.device), depth_hw_full)
 
-    moge_mask_hw = F.interpolate(
-        moge_mask_hw_full.unsqueeze(0).unsqueeze(0).to(torch.float32),
-        size=(target_h, target_w),
-        mode='nearest',
-    ).squeeze(0).squeeze(0).to(torch.bool)
+    # Convert intrinsics to pixel units at 1280x720
+    intr_pix = intrinsics_33_full_norm.clone()
+    intr_pix[0, 0] *= depth_pred_w
+    intr_pix[1, 1] *= depth_pred_h
+    intr_pix[0, 2] *= depth_pred_w
+    intr_pix[1, 2] *= depth_pred_h
 
-    input_image_tensor_chw_target_res = F.interpolate(
-        input_image_for_depth_tensor_chw.unsqueeze(0),
-        size=(target_h, target_w),
-        mode='bilinear',
-        align_corners=False
-    ).squeeze(0)
+    # Resize to target resolution
+    height_scale = target_h / depth_pred_h
+    width_scale  = target_w / depth_pred_w
 
-    moge_image_b1chw_float = input_image_tensor_chw_target_res.unsqueeze(0).unsqueeze(1) * 2 - 1
+    depth_hw = F.interpolate(depth_hw_full[None, None], size=(target_h, target_w),
+                             mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
+    mask_hw  = F.interpolate(mask_hw_full[None, None].float(), size=(target_h, target_w),
+                             mode='nearest').squeeze(0).squeeze(0).bool()
 
-    moge_intrinsics_33 = moge_intrinsics_33_full_pixel.clone()
-    moge_intrinsics_33[1, 1] *= height_scale_factor
-    moge_intrinsics_33[1, 2] *= height_scale_factor
-    moge_intrinsics_33[0, 0] *= width_scale_factor
-    moge_intrinsics_33[0, 2] *= width_scale_factor
+    img_chw_target = F.interpolate(img_chw_0_1[None], size=(target_h, target_w),
+                                   mode='bilinear', align_corners=False).squeeze(0)
+    image_b1chw_float = img_chw_target[None, None] * 2 - 1  # [-1, 1], shape (B=1,1,C,H,W)
 
-    dad_depth_hw = _dad_predict_depth_hw_from_rgb_numpy(input_image_rgb, target_h, target_w, device, dad_processor, dad_model)
-    dad_depth_hw = _rescale_depth_like_reference(dad_depth_hw, moge_depth_hw, moge_mask_hw)
-    dad_depth_hw = torch.where(moge_mask_hw==0, torch.tensor(1000.0, device=dad_depth_hw.device), dad_depth_hw)
+    intrinsics_33 = intr_pix.clone()
+    intrinsics_33[1, 1] *= height_scale
+    intrinsics_33[1, 2] *= height_scale
+    intrinsics_33[0, 0] *= width_scale
+    intrinsics_33[0, 2] *= width_scale
 
-    moge_depth_b11hw = dad_depth_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    moge_depth_b11hw = torch.nan_to_num(moge_depth_b11hw, nan=1e4)
-    moge_depth_b11hw = torch.clamp(moge_depth_b11hw, min=0, max=1e4)
-    moge_mask_b11hw = moge_mask_hw.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    moge_intrinsics_b133 = moge_intrinsics_33.unsqueeze(0).unsqueeze(0)
-    initial_w2c_44 = torch.eye(4, dtype=torch.float32, device=device)
-    moge_initial_w2c_b144 = initial_w2c_44.unsqueeze(0).unsqueeze(0)
+    depth_b11hw = depth_hw[None, None, None]
+    depth_b11hw = torch.nan_to_num(depth_b11hw, nan=1e4).clamp_(0, 1e4)
+    mask_b11hw  = mask_hw[None, None, None]
+    intr_b133   = intrinsics_33[None, None]
+    w2c_b144    = torch.eye(4, dtype=torch.float32, device=device)[None, None]
 
-    return (
-        moge_image_b1chw_float,
-        moge_depth_b11hw,
-        moge_mask_b11hw,
-        moge_initial_w2c_b144,
-        moge_intrinsics_b133,
-    )
+    return image_b1chw_float, depth_b11hw, mask_b11hw, w2c_b144, intr_b133
 
-def _predict_moge_depth_from_tensor(
-    image_tensor_chw_0_1: torch.Tensor, # Shape (C, H_input, W_input), range [0,1]
-    moge_model: MoGeModel,
-    dad_processor: AutoImageProcessor,
-    dad_model: AutoModelForDepthEstimation
+def _predict_moge_depth_from_image_tensor(
+    image_tensor_chw_0_1: torch.Tensor,  # (C,H,W), [0,1]
+    moge_model: MoGeModel
 ):
-    """Run MoGe to get reference stats, then REPLACE depth with DAD predicted depth, rescaled to MoGe."""
+    """Run MoGe on a single RGB frame tensor -> (depth_11hw, mask_11hw)."""
     with _timed("MoGe infer (AR frame)"):
-        moge_output_full = moge_model.infer(image_tensor_chw_0_1)
-    moge_depth_hw_full = moge_output_full["depth"]
-    moge_mask_hw_full = moge_output_full["mask"]
+        out = moge_model.infer(image_tensor_chw_0_1)
+    depth_hw = out["depth"]
+    mask_hw  = out["mask"].bool()
+    depth_11 = torch.nan_to_num(depth_hw[None, None], nan=1e4).clamp_(0, 1e4)
+    mask_11  = mask_hw[None, None]
+    # Put very large sentinel depth on invalid pixels to avoid artifacts in later stages
+    depth_11 = torch.where(mask_11 == 0, torch.tensor(1000.0, device=depth_11.device), depth_11)
+    return depth_11, mask_11
 
-    moge_depth_11hw = moge_depth_hw_full.unsqueeze(0).unsqueeze(0)
-    moge_depth_11hw = torch.nan_to_num(moge_depth_11hw, nan=1e4)
-    moge_depth_11hw = torch.clamp(moge_depth_11hw, min=0, max=1e4)
-    moge_mask_11hw = moge_mask_hw_full.unsqueeze(0).unsqueeze(0)
-    moge_depth_11hw = torch.where(moge_mask_11hw==0, torch.tensor(1000.0, device=moge_depth_11hw.device), moge_depth_11hw)
-
-    with torch.no_grad():
-        img_uint8 = (image_tensor_chw_0_1.clamp(0,1).permute(1,2,0) * 255.0).round().to(torch.uint8).cpu().numpy()
-    target_h, target_w = int(image_tensor_chw_0_1.shape[1]), int(image_tensor_chw_0_1.shape[2])
-    dad_depth_hw = _dad_predict_depth_hw_from_rgb_numpy(img_uint8, target_h, target_w, image_tensor_chw_0_1.device, dad_processor, dad_model)
-    dad_depth_hw = _rescale_depth_like_reference(dad_depth_hw, moge_depth_11hw.squeeze(0).squeeze(0), moge_mask_11hw.squeeze(0).squeeze(0).to(torch.bool))
-    dad_depth_hw = torch.where(moge_mask_11hw.squeeze(0).squeeze(0)==0, torch.tensor(1000.0, device=dad_depth_hw.device), dad_depth_hw)
-    dad_depth_11hw = dad_depth_hw.unsqueeze(0).unsqueeze(0)
-
-    return dad_depth_11hw, moge_mask_11hw
-
+# ----------------------------
+# Main
+# ----------------------------
 def demo(args):
-    """Run video-to-world generation demo.
-
-    This function handles the main video-to-world generation pipeline, including:
-    - Setting up the random seed for reproducibility
-    - Initializing the generation pipeline with the provided configuration
-    - Processing single or multiple prompts/images/videos from input
-    - Generating videos from prompts and images/videos
-    - Saving the generated videos and corresponding prompts to disk
-
-    Args:
-        cfg (argparse.Namespace): Configuration namespace containing:
-            - Model configuration (checkpoint paths, model settings)
-            - Generation parameters (guidance, steps, dimensions)
-            - Input/output settings (prompts/images/videos, save paths)
-            - Performance options (model offloading settings)
-
-    The function will save:
-        - Generated MP4 video files
-        - Text files containing the processed prompts
-
-    If guardrails block the generation, a critical log message is displayed
-    and the function continues to the next prompt if available.
+    """
+    End-to-end:
+      1) MoGe predicts depth+intrinsics+mask for the input image (no DAD).
+      2) Cache3D buffers the initial frame for geometric warping along a camera trajectory.
+      3) Render warped conditioning frames (the "input video" to diffusion).
+      4) Gen3C synthesizes frames chunk-by-chunk; AR passes update Cache3D with latest frame's depth.
+      5) Optionally save:
+          - depth frames (PNG16),
+          - mask frames (PNG),
+          - conditioning sequence (MP4),
+          - final video (MP4, optionally side-by-side with warps).
     """
     t_total_start = _now_perf()
     misc.set_random_seed(args.seed)
-    inference_type = "video2world"
     validate_args(args)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Runtime device: {device}, CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -313,19 +263,10 @@ def demo(args):
             pass
     log.info(f"Args snapshot: {args}")
 
-    if args.num_gpus > 1:
-        from megatron.core import parallel_state
-
-        from cosmos_predict1.utils import distributed
-
-        with _timed("Distributed init"):
-            distributed.init()
-            parallel_state.initialize_model_parallel(context_parallel_size=args.num_gpus)
-            process_group = parallel_state.get_context_parallel_group()
-
+    # Pipeline
     with _timed("Init Gen3cPipeline"):
         pipeline = Gen3cPipeline(
-            inference_type=inference_type,
+            inference_type="video2world",
             checkpoint_dir=args.checkpoint_dir,
             checkpoint_name="Gen3C-Cosmos-7B",
             prompt_upsampler_dir=args.prompt_upsampler_dir,
@@ -342,56 +283,66 @@ def demo(args):
             height=args.height,
             width=args.width,
             fps=args.fps,
-            num_video_frames=121,
+            num_video_frames=args.num_video_frames,
             seed=args.seed,
         )
 
     frame_buffer_max = pipeline.model.frame_buffer_max
+    sample_n_frames  = pipeline.model.chunk_size
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    sample_n_frames = pipeline.model.chunk_size
 
+    # Load MoGe
     with _timed("Load MoGe"):
         moge_model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
-    with _timed(f"Load DAD model ({'cpu' if device.type=='cpu' else 'cuda'})"):
-        dad_processor = AutoImageProcessor.from_pretrained(args.dad_model_id)
-        dad_model = AutoModelForDepthEstimation.from_pretrained(args.dad_model_id).to(device).eval()
 
-    if args.num_gpus > 1:
-        pipeline.model.net.enable_context_parallel(process_group)
-
+    # Inputs
     if args.batch_input_path:
         log.info(f"Reading batch inputs from path: {args.batch_input_path}")
         prompts = read_prompts_from_file(args.batch_input_path)
     else:
-        prompts = [{"prompt": args.prompt, "visual_input": args.input_image_path}]
+        prompts = [{"prompt": args.prompt or "", "visual_input": args.input_image_path}]
 
-    os.makedirs(os.path.dirname(args.video_save_folder), exist_ok=True)
+    # Output dirs
+    os.makedirs(args.video_save_folder, exist_ok=True)
+    _ensure_dir(args.save_depth_dir)
+    _ensure_dir(args.save_mask_dir)
+
     for i, input_dict in enumerate(prompts):
         t_item_start = _now_perf()
-        current_prompt = input_dict.get("prompt", None)
-        if current_prompt is None and args.disable_prompt_upsampler:
-            log.critical("Prompt is missing, skipping world generation.")
-            continue
+        current_prompt = input_dict.get("prompt", "")
         current_image_path = input_dict.get("visual_input", None)
         if current_image_path is None:
-            log.critical("Visual input is missing, skipping world generation.")
+            log.critical("Visual input is missing, skipping.")
             continue
-
-        log.info(f"Item {i}: input={current_image_path}, movement={args.movement_distance}, frames={args.num_video_frames}, chunk={sample_n_frames}, guidance={args.guidance}")
 
         if not check_input_frames(current_image_path, 1):
-            print(f"Input image {current_image_path} is not valid, skipping.")
+            log.critical(f"Input image {current_image_path} is not valid, skipping.")
             continue
 
-        with _timed("Depth+intrinsics init (MoGe+DAD)"):
-            (
-                moge_image_b1chw_float,
-                moge_depth_b11hw,
-                moge_mask_b11hw,
-                moge_initial_w2c_b144,
-                moge_intrinsics_b133,
-            ) = _predict_moge_depth(
-                current_image_path, args.height, args.width, device, moge_model, dad_processor, dad_model
+        log.info(f"Item {i}: input={current_image_path}, movement={args.movement_distance}, "
+                 f"frames={args.num_video_frames}, chunk={sample_n_frames}, guidance={args.guidance}")
+
+        # MoGe depth/intrinsics/mask + initial cache
+        with _timed("Depth+intrinsics init (MoGe)"):
+            (moge_image_b1chw_float,
+             moge_depth_b11hw,
+             moge_mask_b11hw,
+             moge_initial_w2c_b144,
+             moge_intrinsics_b133) = _predict_moge_depth_intrinsics(
+                current_image_path, args.height, args.width, device, moge_model
+            )
+
+        # Optional save of the very first depth/mask
+        if args.save_depth_dir:
+            _save_depth_png16(
+                moge_depth_b11hw[0, 0, 0],  # (H,W)
+                moge_mask_b11hw[0, 0, 0],
+                os.path.join(args.save_depth_dir, f"{args.video_save_name}_depth_{0:04d}.png"),
+            )
+        if args.save_mask_dir:
+            _save_mask_png(
+                moge_mask_b11hw[0, 0, 0],
+                os.path.join(args.save_mask_dir, f"{args.video_save_name}_mask_{0:04d}.png"),
             )
 
         with _timed("Cache3D init"):
@@ -401,145 +352,154 @@ def demo(args):
                 noise_aug_strength=args.noise_aug_strength,
                 input_image=moge_image_b1chw_float[:, 0].clone(),
                 input_depth=moge_depth_b11hw[:, 0],
-                # input_mask=moge_mask_b11hw[:, 0],
+                # input_mask=moge_mask_b11hw[:, 0],  # optional, kept disabled to match earlier behavior
                 input_w2c=moge_initial_w2c_b144[:, 0],
                 input_intrinsics=moge_intrinsics_b133[:, 0],
                 filter_points_threshold=args.filter_points_threshold,
                 foreground_masking=args.foreground_masking,
             )
 
+        # Trajectory
         initial_cam_w2c_for_traj = moge_initial_w2c_b144[0, 0]
         initial_cam_intrinsics_for_traj = moge_intrinsics_b133[0, 0]
+        with _timed("Trajectory generation"):
+            generated_w2cs, generated_intrinsics = generate_camera_trajectory(
+                trajectory_type=args.trajectory,
+                initial_w2c=initial_cam_w2c_for_traj,
+                initial_intrinsics=initial_cam_intrinsics_for_traj,
+                num_frames=args.num_video_frames,
+                movement_distance=args.movement_distance,
+                camera_rotation=args.camera_rotation,
+                center_depth=1.0,
+                device=device.type,
+            )
 
-        try:
-            with _timed("Trajectory generation"):
-                generated_w2cs, generated_intrinsics = generate_camera_trajectory(
-                    trajectory_type=args.trajectory,
-                    initial_w2c=initial_cam_w2c_for_traj,
-                    initial_intrinsics=initial_cam_intrinsics_for_traj,
-                    num_frames=args.num_video_frames,
-                    movement_distance=args.movement_distance,
-                    camera_rotation=args.camera_rotation,
-                    center_depth=1.0,
-                    device=device.type,
-                )
-        except (ValueError, NotImplementedError) as e:
-            log.critical(f"Failed to generate trajectory: {e}")
-            continue
-
+        # Render the first conditioning chunk
         with _timed(f"Render cache [0:{sample_n_frames}]"):
             rendered_warp_images, rendered_warp_masks = cache.render_cache(
                 generated_w2cs[:, 0:sample_n_frames],
                 generated_intrinsics[:, 0:sample_n_frames],
             )
 
-        all_rendered_warps = []
-        if args.save_buffer:
-            all_rendered_warps.append(rendered_warp_images.clone().cpu())
+        # For optional conditioning video: keep a running list of warp chunks
+        conditioning_chunks = []
+        if args.save_conditioning_video:
+            conditioning_chunks.append(rendered_warp_images.clone().cpu())  # (1, N, 3, H, W)
 
+        # Optionally also show buffers side-by-side in final video
+        all_rendered_warps_for_sbs = []
+        if args.save_buffer:
+            all_rendered_warps_for_sbs.append(rendered_warp_images.clone().cpu())
+
+        # Generate first chunk
         with _timed(f"Pipeline.generate [0:{sample_n_frames}]"):
             generated_output = pipeline.generate(
                 prompt=current_prompt,
-                image_path=current_image_path,
+                image_path=current_image_path,  # path string for first call
                 negative_prompt=args.negative_prompt,
                 rendered_warp_images=rendered_warp_images,
                 rendered_warp_masks=rendered_warp_masks,
             )
         if generated_output is None:
-            log.critical("Guardrail blocked video2world generation.")
+            log.critical("Guardrail blocked generation.")
             continue
-        video, prompt = generated_output
+        video, prompt_text = generated_output  # video: (T, H, W, 3) uint8
 
+        # Autoregressive passes
         num_ar_iterations = (generated_w2cs.shape[1] - 1) // (sample_n_frames - 1)
         for num_iter in range(1, num_ar_iterations):
             start_frame_idx = num_iter * (sample_n_frames - 1)
             end_frame_idx = start_frame_idx + sample_n_frames
+            log.info(f"AR pass {num_iter}/{num_ar_iterations - 1}: frames [{start_frame_idx}:{end_frame_idx}]")
 
-            log.info(f"Autoregressive pass {num_iter}/{num_ar_iterations-1}: frames [{start_frame_idx}:{end_frame_idx}]")
+            # Use last synthesized frame to bootstrap new depth
+            last_frame_hwc_0_255 = torch.tensor(video[-1], device=device)        # (H,W,3) uint8
+            frame_chw_0_1 = last_frame_hwc_0_255.permute(2, 0, 1).float() / 255.0
 
-            last_frame_hwc_0_255 = torch.tensor(video[-1], device=device)
-            pred_image_for_depth_chw_0_1 = last_frame_hwc_0_255.permute(2, 0, 1) / 255.0
+            with _timed("MoGe depth predict (AR)"):
+                pred_depth_11, pred_mask_11 = _predict_moge_depth_from_image_tensor(frame_chw_0_1, moge_model)
 
-            with _timed("Depth predict (AR MoGe+DAD replace)"):
-                pred_depth, pred_mask = _predict_moge_depth_from_tensor(
-                    pred_image_for_depth_chw_0_1, moge_model, dad_processor, dad_model
+            # Optional save AR depth/mask (use the timeline index where this frame lands)
+            if args.save_depth_dir:
+                _save_depth_png16(
+                    pred_depth_11[0, 0], pred_mask_11[0, 0],
+                    os.path.join(args.save_depth_dir, f"{args.video_save_name}_depth_{start_frame_idx:04d}.png")
+                )
+            if args.save_mask_dir:
+                _save_mask_png(
+                    pred_mask_11[0, 0],
+                    os.path.join(args.save_mask_dir, f"{args.video_save_name}_mask_{start_frame_idx:04d}.png")
                 )
 
+            # Update cache with this latest frame's geometry
             with _timed("Cache3D update"):
                 cache.update_cache(
-                    new_image=pred_image_for_depth_chw_0_1.unsqueeze(0) * 2 - 1,
-                    new_depth=pred_depth,
-                    # new_mask=pred_mask,
+                    new_image=frame_chw_0_1[None] * 2 - 1,  # [-1,1], (1,C,H,W)
+                    new_depth=pred_depth_11,
+                    # new_mask=pred_mask_11,  # keep disabled (consistent with above)
                     new_w2c=generated_w2cs[:, start_frame_idx],
                     new_intrinsics=generated_intrinsics[:, start_frame_idx],
                 )
-            current_segment_w2cs = generated_w2cs[:, start_frame_idx:end_frame_idx]
-            current_segment_intrinsics = generated_intrinsics[:, start_frame_idx:end_frame_idx]
+
+            current_w2cs = generated_w2cs[:, start_frame_idx:end_frame_idx]
+            current_intr = generated_intrinsics[:, start_frame_idx:end_frame_idx]
             with _timed(f"Render cache [{start_frame_idx}:{end_frame_idx}]"):
-                rendered_warp_images, rendered_warp_masks = cache.render_cache(
-                    current_segment_w2cs,
-                    current_segment_intrinsics,
-                )
+                rendered_warp_images, rendered_warp_masks = cache.render_cache(current_w2cs, current_intr)
+
+            if args.save_conditioning_video:
+                conditioning_chunks.append(rendered_warp_images[:, 1:].clone().cpu())  # drop overlap
 
             if args.save_buffer:
-                all_rendered_warps.append(rendered_warp_images[:, 1:].clone().cpu())
+                all_rendered_warps_for_sbs.append(rendered_warp_images[:, 1:].clone().cpu())
 
-            pred_image_for_depth_bcthw_minus1_1 = pred_image_for_depth_chw_0_1.unsqueeze(0).unsqueeze(2) * 2 - 1
+            # Generate next chunk (now passing a tensor image)
+            frame_bcthw_minus1_1 = frame_chw_0_1[None, None] * 2 - 1  # (1,1,C,H,W)
             with _timed(f"Pipeline.generate [{start_frame_idx}:{end_frame_idx}]"):
                 generated_output = pipeline.generate(
                     prompt=current_prompt,
-                    image_path=pred_image_for_depth_bcthw_minus1_1,
+                    image_path=frame_bcthw_minus1_1,
                     negative_prompt=args.negative_prompt,
                     rendered_warp_images=rendered_warp_images,
                     rendered_warp_masks=rendered_warp_masks,
                 )
-            video_new, prompt = generated_output
-            video = np.concatenate([video, video_new[1:]], axis=0)
+            video_new, prompt_text = generated_output
+            video = np.concatenate([video, video_new[1:]], axis=0)  # append, skip duplicate
 
+        # Compose final video, optionally side-by-side with warp buffers
         final_video_to_save = video
         final_width = args.width
 
-        if args.save_buffer and all_rendered_warps:
-            squeezed_warps = [t.squeeze(0) for t in all_rendered_warps]
+        if args.save_buffer and all_rendered_warps_for_sbs:
+            # Stack all rendered warp chunks to same N and concat horizontally with the output
+            squeezed = [t.squeeze(0) for t in all_rendered_warps_for_sbs]  # [(N,C,H,W), ...]
+            n_max = max(t.shape[0] for t in squeezed)
 
-            if squeezed_warps:
-                n_max = max(t.shape[1] for t in squeezed_warps)
+            padded_list = []
+            for t in squeezed:
+                # pad along time N
+                pad_n = n_max - t.shape[0]
+                pad_spec = (0, 0, 0, 0, 0, 0, 0, pad_n)  # (W,C,H,N) reversed by F.pad order
+                # Convert to (C,H,N,W) before pad for simplicity
+                t_CHNW = t.permute(1, 2, 0, 3)
+                t_pad = F.pad(t_CHNW, pad_spec, mode='constant', value=-1.0)
+                padded_list.append(t_pad)
 
-                padded_t_list = []
-                for sq_t in squeezed_warps:
-                    current_n_i = sq_t.shape[1]
-                    padding_needed_dim1 = n_max - current_n_i
+            # Cat along CHNW batch (i.e., rows), then unstack into a single wide image per frame
+            cat_CHNW = torch.cat(padded_list, dim=0)                               # (C*k, H, N, W)
+            # Back to (N,C,H,k*W)
+            cat_NCHW = cat_CHNW.permute(2, 0, 1, 3)
+            # [-1,1] -> [0,255]
+            cat_NCHW = ((cat_NCHW * 0.5 + 0.5) * 255.0).clamp(0, 255).byte()
+            cat_NHWC = cat_NCHW.permute(0, 2, 3, 1).cpu().numpy()                  # (N,H,W_all,C)
+            final_video_to_save = np.concatenate([cat_NHWC, final_video_to_save], axis=2)
+            final_width = final_video_to_save.shape[2]
+            log.info(f"Concatenated with warp buffers. Final width = {final_width}")
 
-                    pad_spec = (0,0,
-                                0,0,
-                                0,0,
-                                0,padding_needed_dim1,
-                                0,0)
-                    padded_t = F.pad(sq_t, pad_spec, mode='constant', value=-1.0)
-                    padded_t_list.append(padded_t)
-
-                full_rendered_warp_tensor = torch.cat(padded_t_list, dim=0)
-
-                T_total, _, C_dim, H_dim, W_dim = full_rendered_warp_tensor.shape
-                buffer_video_TCHnW = full_rendered_warp_tensor.permute(0, 2, 3, 1, 4)
-                buffer_video_TCHWstacked = buffer_video_TCHnW.contiguous().view(T_total, C_dim, H_dim, n_max * W_dim)
-                buffer_video_TCHWstacked = (buffer_video_TCHWstacked * 0.5 + 0.5) * 255.0
-                buffer_numpy_TCHWstacked = buffer_video_TCHWstacked.cpu().numpy().astype(np.uint8)
-                buffer_numpy_THWC = np.transpose(buffer_numpy_TCHWstacked, (0, 2, 3, 1))
-
-                final_video_to_save = np.concatenate([buffer_numpy_THWC, final_video_to_save], axis=2)
-                final_width = args.width * (1 + n_max)
-                log.info(f"Concatenating video with {n_max} warp buffers. Final video width will be {final_width}")
-            else:
-                log.info("No warp buffers to save.")
-
+        # Save final video
         video_save_path = os.path.join(
             args.video_save_folder,
             f"{i if args.batch_input_path else args.video_save_name}.mp4"
         )
-
-        os.makedirs(os.path.dirname(video_save_path), exist_ok=True)
-
         with _timed("Save video"):
             save_video(
                 video=final_video_to_save,
@@ -550,16 +510,28 @@ def demo(args):
                 video_save_path=video_save_path,
             )
         log.info(f"Saved video to {video_save_path}")
+
+        # Save the conditioning ("input") video if requested
+        if args.save_conditioning_video and conditioning_chunks:
+            # Concatenate along time dimension; first chunk keeps all frames, others drop overlap
+            cond = torch.cat(conditioning_chunks, dim=1)            # (1, T, 3, H, W)
+            cond_THWC = ((cond.squeeze(0).permute(0, 2, 3, 1) * 0.5 + 0.5)
+                          * 255.0).clamp(0, 255).byte().cpu().numpy()
+            cond_path = os.path.join(args.video_save_folder, args.conditioning_video_name)
+            with _timed("Save conditioning video"):
+                save_video(
+                    video=cond_THWC,
+                    fps=args.fps,
+                    H=args.height,
+                    W=args.width,
+                    video_save_quality=5,
+                    video_save_path=cond_path,
+                )
+            log.info(f"Saved conditioning video to {cond_path}")
+
         log.info(f"Item {i} total elapsed: {(time.perf_counter() - t_item_start):.3f}s")
 
-    if args.num_gpus > 1:
-        parallel_state.destroy_model_parallel()
-        import torch.distributed as dist
-
-        dist.destroy_process_group()
-
     log.info(f"Overall elapsed: {(time.perf_counter() - t_total_start):.3f}s")
-
 
 if __name__ == "__main__":
     args = parse_arguments()
