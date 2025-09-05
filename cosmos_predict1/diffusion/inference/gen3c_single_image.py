@@ -127,7 +127,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_conditioning_video", action="store_true",
                         help="If set, saves the camera-warped conditioning sequence as MP4.")
     parser.add_argument("--conditioning_video_name", type=str, default="input_conditioning.mp4",
-                        help="Filename (with or without .mp4) for the conditioning MP4 (in video_save_folder).")
+                        help="Filename for the conditioning MP4 (in video_save_folder).")
 
     return parser
 
@@ -403,7 +403,7 @@ def demo(args):
         if generated_output is None:
             log.critical("Guardrail blocked generation.")
             continue
-        video, prompt_text = generated_output  # video: (T, H, W, 3) uint8
+        video, prompt_text = generated_output  # (T, H, W, 3) uint8
 
         # Autoregressive passes
         num_ar_iterations = (generated_w2cs.shape[1] - 1) // (sample_n_frames - 1)
@@ -419,7 +419,7 @@ def demo(args):
             with _timed("MoGe depth predict (AR)"):
                 pred_depth_11, pred_mask_11 = _predict_moge_depth_from_image_tensor(frame_chw_0_1, moge_model)
 
-            # Optional save AR depth/mask (use the timeline index where this frame lands)
+            # Optional save AR depth/mask
             if args.save_depth_dir:
                 _save_depth_png16(
                     pred_depth_11[0, 0], pred_mask_11[0, 0],
@@ -470,30 +470,27 @@ def demo(args):
         final_width = args.width
 
         if args.save_buffer and all_rendered_warps_for_sbs:
-            # Each item: (1, N_i, 3, H, W) -> (N_i, 3, H, W)
-            squeezed = [t.squeeze(0) for t in all_rendered_warps_for_sbs]  # list of (N_i, C=3, H, W)
+            # Stack all rendered warp chunks to same N and concat horizontally with the output
+            squeezed = [t.squeeze(0) for t in all_rendered_warps_for_sbs]  # [(N,C,H,W), ...]
             n_max = max(t.shape[0] for t in squeezed)
 
-            # Pad along time with -1.0 (black after scaling) so all sequences have same length
-            padded = []
+            padded_list = []
             for t in squeezed:
-                if t.shape[0] < n_max:
-                    pad_frames = n_max - t.shape[0]
-                    pad = torch.full((pad_frames, t.shape[1], t.shape[2], t.shape[3]),
-                                     -1.0, dtype=t.dtype, device=t.device)
-                    t = torch.cat([t, pad], dim=0)
-                padded.append(t)  # (n_max, 3, H, W)
+                # pad along time N
+                pad_n = n_max - t.shape[0]
+                pad_spec = (0, 0, 0, 0, 0, 0, 0, pad_n)  # (W,C,H,N) reversed by F.pad order
+                # Convert to (C,H,N,W) before pad for simplicity
+                t_CHNW = t.permute(1, 2, 0, 3)
+                t_pad = F.pad(t_CHNW, pad_spec, mode='constant', value=-1.0)
+                padded_list.append(t_pad)
 
-            # Concatenate horizontally across W
-            cat_NCHW = torch.cat(padded, dim=3)  # (n_max, 3, H, sum_W)
-            cat_NHWC = cat_NCHW.permute(0, 2, 3, 1)  # (n_max, H, sum_W, 3)
-            cat_NHWC = ((cat_NHWC * 0.5 + 0.5) * 255.0).clamp(0, 255).byte().cpu().numpy()
-
-            # Match time dimension of final video if needed (truncate to min length)
-            min_len = min(cat_NHWC.shape[0], final_video_to_save.shape[0])
-            cat_NHWC = cat_NHWC[:min_len]
-            final_video_to_save = final_video_to_save[:min_len]
-
+            # Cat along CHNW batch (i.e., rows), then unstack into a single wide image per frame
+            cat_CHNW = torch.cat(padded_list, dim=0)                               # (C*k, H, N, W)
+            # Back to (N,C,H,k*W)
+            cat_NCHW = cat_CHNW.permute(2, 0, 1, 3)
+            # [-1,1] -> [0,255]
+            cat_NCHW = ((cat_NCHW * 0.5 + 0.5) * 255.0).clamp(0, 255).byte()
+            cat_NHWC = cat_NCHW.permute(0, 2, 3, 1).cpu().numpy()                  # (N,H,W_all,C)
             final_video_to_save = np.concatenate([cat_NHWC, final_video_to_save], axis=2)
             final_width = final_video_to_save.shape[2]
             log.info(f"Concatenated with warp buffers. Final width = {final_width}")
@@ -514,19 +511,26 @@ def demo(args):
             )
         log.info(f"Saved video to {video_save_path}")
 
-        # Save the conditioning ("input") video if requested
+        # Save the conditioning ("input") video if requested — FIXED
         if args.save_conditioning_video and conditioning_chunks:
             # Concatenate along time dimension; first chunk keeps all frames, others drop overlap
-            cond = torch.cat(conditioning_chunks, dim=1)  # (B, T, 3, H, W)
-            # Flatten (B,T) -> (B*T) to be robust even if B != 1
-            cond_THWC = ((cond.flatten(0, 1).permute(0, 2, 3, 1) * 0.5 + 0.5)
-                          * 255.0).clamp(0, 255).byte().cpu().numpy()
+            cond = torch.cat(conditioning_chunks, dim=1)            # (B=1, T, C=3, H, W)
 
-            # Ensure .mp4 extension even if the name was passed without it
-            cond_name = args.conditioning_video_name
-            if not cond_name.lower().endswith(".mp4"):
-                cond_name = cond_name + ".mp4"
-            cond_path = os.path.join(args.video_save_folder, cond_name)
+            # Some backends may return sparse tensors; convert to dense before permute/reshape.
+            if cond.is_sparse:
+                cond = cond.to_dense()
+
+            # Permute 5 dims first, then flatten (B,T,H,W,C) -> (B*T, H, W, C)
+            B, T, C, H, W = cond.shape
+            cond_THWC = ((cond.permute(0, 1, 3, 4, 2)  # (B,T,H,W,C)
+                              .reshape(B * T, H, W, C) * 0.5 + 0.5)
+                              * 255.0).clamp(0, 255).byte().cpu().numpy()
+
+            # Ensure .mp4 extension even if a stem was provided
+            name = args.conditioning_video_name
+            if not name.lower().endswith(".mp4"):
+                name += ".mp4"
+            cond_path = os.path.join(args.video_save_folder, name)
 
             with _timed("Save conditioning video"):
                 save_video(
