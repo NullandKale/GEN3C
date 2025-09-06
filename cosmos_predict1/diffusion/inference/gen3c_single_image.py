@@ -138,7 +138,7 @@ def _dad_predict_depth_hw_from_rgb_numpy(input_image_rgb: np.ndarray,
             outputs = dad_model(**inputs)
         post = dad_processor.post_process_depth_estimation(outputs, target_sizes=[(target_h, target_w)])
         depth_hw = post[0]["predicted_depth"].to(device).to(torch.float32)
-    return depth_hw
+    return 1.0 - depth_hw
 
 def _rescale_depth_like_reference(dad_hw: torch.Tensor,
                                   ref_hw: torch.Tensor) -> torch.Tensor:
