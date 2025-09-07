@@ -1,0 +1,252 @@
+# gen3c_from_quilt.py
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+import time
+from contextlib import contextmanager
+
+from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
+from cosmos_predict1.utils import log, misc
+from cosmos_predict1.utils.io import save_video
+
+torch.enable_grad(False)
+
+@contextmanager
+def _timed(section: str):
+    t0 = time.perf_counter()
+    log.info(f"[TIMER] {section} | start")
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        log.info(f"[TIMER] {section} | end: {dt:.3f}s")
+
+def _ensure_dir(d: str | None):
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def _frames_to_b1tchw_minus1_1(frames_rgb_uint8: list[np.ndarray], height: int, width: int, device: torch.device) -> torch.Tensor:
+    outs = []
+    for f in frames_rgb_uint8:
+        if f.shape[0] != height or f.shape[1] != width:
+            f = cv2.resize(f, (width, height), interpolation=cv2.INTER_AREA)
+        t = torch.from_numpy(f).to(device=device, dtype=torch.float32) / 255.0
+        t = t.permute(2, 0, 1)
+        outs.append(t)
+    T = len(outs)
+    if T == 0:
+        raise ValueError("No frames extracted from quilt.")
+    stack = torch.stack(outs, dim=0)
+    stack = stack.unsqueeze(0)
+    stack = stack.permute(0, 1, 2, 3, 4)
+    stack = stack * 2.0 - 1.0
+    return stack
+
+def _ones_masks_like_images_b1tchw(imgs_b1tchw: torch.Tensor) -> torch.Tensor:
+    B, T, C, H, W = imgs_b1tchw.shape
+    masks = torch.ones((B, T, 1, H, W), dtype=torch.float32, device=imgs_b1tchw.device)
+    return masks
+
+def _extract_quilt_frames(
+    quilt_path: str,
+    grid_cols: int,
+    grid_rows: int,
+    total_frames: int | None,
+    order: str,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    gap_x: int,
+    gap_y: int
+) -> list[np.ndarray]:
+    img_bgr = cv2.imread(quilt_path, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise FileNotFoundError(f"Quilt image not found: {quilt_path}")
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    H, W = img_rgb.shape[:2]
+    work_w = W - left - right
+    work_h = H - top - bottom
+    if work_w <= 0 or work_h <= 0:
+        raise ValueError(f"Invalid crop margins; got work area {work_w}x{work_h}.")
+    if grid_cols <= 0 or grid_rows <= 0:
+        raise ValueError("grid_cols and grid_rows must be positive.")
+    if grid_cols == 1:
+        tile_w = work_w
+    else:
+        tile_w = (work_w - (grid_cols - 1) * gap_x) // grid_cols
+    if grid_rows == 1:
+        tile_h = work_h
+    else:
+        tile_h = (work_h - (grid_rows - 1) * gap_y) // grid_rows
+    if tile_w <= 0 or tile_h <= 0:
+        raise ValueError(f"Computed non-positive tile size {tile_w}x{tile_h}. Check gaps/margins.")
+    idxs = []
+    if order == "row-major":
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                idxs.append((r, c))
+    elif order == "col-major":
+        for c in range(grid_cols):
+            for r in range(grid_rows):
+                idxs.append((r, c))
+    else:
+        raise ValueError("order must be 'row-major' or 'col-major'.")
+    max_frames = grid_cols * grid_rows
+    T = total_frames if total_frames is not None else max_frames
+    T = max(0, min(T, max_frames))
+    frames = []
+    for k, (r, c) in enumerate(idxs):
+        if k >= T:
+            break
+        x0 = left + c * (tile_w + gap_x)
+        y0 = top + r * (tile_h + gap_y)
+        crop = img_rgb[y0:y0 + tile_h, x0:x0 + tile_w, :]
+        if crop.shape[0] != tile_h or crop.shape[1] != tile_w:
+            continue
+        frames.append(crop.copy())
+    return frames
+
+def create_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="GEN3C from quilt image: unpack grid -> conditioning video -> generate.")
+    p.add_argument("--quilt_path", type=str, required=True, help="Path to the quilt image with frames arranged in a grid.")
+    p.add_argument("--grid_cols", type=int, required=True, help="Number of columns in the quilt grid.")
+    p.add_argument("--grid_rows", type=int, required=True, help="Number of rows in the quilt grid.")
+    p.add_argument("--total_frames", type=int, default=None, help="Optional cap on frames to read; default uses all tiles.")
+    p.add_argument("--order", type=str, choices=["row-major", "col-major"], default="row-major", help="Traversal order for tiles.")
+    p.add_argument("--left", type=int, default=0, help="Left margin to skip before tiles.")
+    p.add_argument("--top", type=int, default=0, help="Top margin to skip before tiles.")
+    p.add_argument("--right", type=int, default=0, help="Right margin to skip after tiles.")
+    p.add_argument("--bottom", type=int, default=0, help="Bottom margin to skip after tiles.")
+    p.add_argument("--gap_x", type=int, default=0, help="Horizontal gap (pixels) between tiles.")
+    p.add_argument("--gap_y", type=int, default=0, help="Vertical gap (pixels) between tiles.")
+    p.add_argument("--checkpoint_dir", type=str, required=True, help="Path to gen3c checkpoint directory (contains Gen3C-Cosmos-7B).")
+    p.add_argument("--video_save_folder", type=str, default="outputs", help="Folder for generated outputs.")
+    p.add_argument("--video_save_name", type=str, default="gen3c_from_quilt", help="Base name for the output MP4.")
+    p.add_argument("--height", type=int, default=576, help="Target H for generation and conditioning frames.")
+    p.add_argument("--width", type=int, default=1024, help="Target W for generation and conditioning frames.")
+    p.add_argument("--fps", type=int, default=24, help="FPS for output video.")
+    p.add_argument("--guidance", type=float, default=1.0, help="CFG guidance.")
+    p.add_argument("--num_steps", type=int, default=25, help="Diffusion steps.")
+    p.add_argument("--seed", type=int, default=1234, help="Random seed.")
+    p.add_argument("--disable_guardrail", action="store_true", help="Disable guardrails.")
+    p.add_argument("--disable_prompt_upsampler", action="store_true", help="Disable prompt upsampler.")
+    p.add_argument("--prompt_upsampler_dir", type=str, default="Pixtral-12B", help="Prompt upsampler weights directory relative to checkpoint_dir.")
+    p.add_argument("--negative_prompt", type=str, default=None, help="Optional negative prompt.")
+    p.add_argument("--prompt", type=str, default="", help="Text prompt (optional).")
+    p.add_argument("--offload_diffusion_transformer", action="store_true", help="Offload diffusion transformer.")
+    p.add_argument("--offload_tokenizer", action="store_true", help="Offload tokenizer.")
+    p.add_argument("--offload_text_encoder_model", action="store_true", help="Offload text encoder model.")
+    p.add_argument("--offload_prompt_upsampler", action="store_true", help="Offload prompt upsampler.")
+    p.add_argument("--offload_guardrail_models", action="store_true", help="Offload guardrail models.")
+    p.add_argument("--disable_prompt_encoder", action="store_true", help="Disable prompt encoder.")
+    p.add_argument("--save_conditioning_video", action="store_true", help="If set, write the unpacked conditioning video.")
+    p.add_argument("--conditioning_video_name", type=str, default="conditioning_from_quilt.mp4", help="Filename for conditioning video.")
+    return p
+
+def demo(args: argparse.Namespace) -> None:
+    t_total_start = time.perf_counter()
+    misc.set_random_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Device: {device} (CUDA={torch.cuda.is_available()})")
+    _ensure_dir(args.video_save_folder)
+    with _timed("Unpack quilt"):
+        frames_rgb = _extract_quilt_frames(
+            quilt_path=args.quilt_path,
+            grid_cols=args.grid_cols,
+            grid_rows=args.grid_rows,
+            total_frames=args.total_frames,
+            order=args.order,
+            left=args.left,
+            top=args.top,
+            right=args.right,
+            bottom=args.bottom,
+            gap_x=args.gap_x,
+            gap_y=args.gap_y
+        )
+        log.info(f"Extracted {len(frames_rgb)} frames from quilt.")
+    with _timed("Build conditioning tensor"):
+        cond_b1tchw = _frames_to_b1tchw_minus1_1(frames_rgb, args.height, args.width, device)
+        masks_b1t1hw = _ones_masks_like_images_b1tchw(cond_b1tchw)
+        log.info(f"Conditioning tensor shape: {tuple(cond_b1tchw.shape)}; masks: {tuple(masks_b1t1hw.shape)}")
+    if args.save_conditioning_video:
+        try:
+            cond_NHWC = ((cond_b1tchw[0].permute(0, 2, 3, 1).float() * 0.5 + 0.5) * 255.0).clamp(0, 255).byte().cpu().numpy()
+            cond_path = os.path.join(args.video_save_folder, args.conditioning_video_name)
+            with _timed("Save conditioning video"):
+                save_video(video=cond_NHWC, fps=args.fps, H=args.height, W=args.width, video_save_quality=5, video_save_path=cond_path)
+            log.info(f"Saved conditioning video to {cond_path}")
+        except Exception as e:
+            log.exception(f"Failed to save conditioning video (non-fatal): {e}")
+    with _timed("Init Gen3cPipeline"):
+        pipeline = Gen3cPipeline(
+            inference_type="video2world",
+            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_name="Gen3C-Cosmos-7B",
+            prompt_upsampler_dir=args.prompt_upsampler_dir,
+            enable_prompt_upsampler=not args.disable_prompt_upsampler,
+            offload_network=args.offload_diffusion_transformer,
+            offload_tokenizer=args.offload_tokenizer,
+            offload_text_encoder_model=args.offload_text_encoder_model,
+            offload_prompt_upsampler=args.offload_prompt_upsampler,
+            offload_guardrail_models=args.offload_guardrail_models,
+            disable_guardrail=args.disable_guardrail,
+            disable_prompt_encoder=args.disable_prompt_encoder,
+            guidance=args.guidance,
+            num_steps=args.num_steps,
+            height=args.height,
+            width=args.width,
+            fps=args.fps,
+            num_video_frames=cond_b1tchw.shape[1],
+            seed=args.seed,
+        )
+    sample_n_frames = pipeline.model.chunk_size
+    T_total = int(cond_b1tchw.shape[1])
+    log.info(f"Model chunk_size={sample_n_frames}, total_frames={T_total}")
+    video_out_list = []
+    with _timed("Generate"):
+        start = 0
+        while start < T_total:
+            end = min(start + sample_n_frames, T_total)
+            chunk_imgs = cond_b1tchw[:, start:end]
+            chunk_masks = masks_b1t1hw[:, start:end]
+            if start == 0:
+                img0_bcthw = chunk_imgs[:, 0:1].permute(0, 2, 1, 3, 4)
+            generated = pipeline.generate(
+                prompt=args.prompt or "",
+                image_path=img0_bcthw if start == 0 else img0_bcthw,
+                negative_prompt=args.negative_prompt,
+                rendered_warp_images=chunk_imgs,
+                rendered_warp_masks=chunk_masks,
+            )
+            if generated is None:
+                log.critical("Guardrail blocked generation; aborting this item.")
+                break
+            video_chunk, prompt_text = generated
+            if start == 0:
+                video_out_list.append(video_chunk)
+            else:
+                video_out_list.append(video_chunk[1:])
+            last_frame = torch.from_numpy(video_chunk[-1]).to(device=device, dtype=torch.float32) / 255.0
+            last_chw = last_frame.permute(2, 0, 1)
+            img0_bcthw = (last_chw.unsqueeze(0).unsqueeze(2) * 2.0 - 1.0)
+            start = end - 1
+    if not video_out_list:
+        raise RuntimeError("No output frames produced.")
+    video_array = np.concatenate(video_out_list, axis=0)
+    out_path = os.path.join(args.video_save_folder, f"{args.video_save_name}.mp4")
+    with _timed("Save output video"):
+        save_video(video=video_array, fps=args.fps, H=args.height, W=args.width, video_save_quality=5, video_save_path=out_path)
+    log.info(f"Saved video to {out_path}")
+    log.info(f"Overall elapsed: {(time.perf_counter() - t_total_start):.3f}s")
+
+if __name__ == "__main__":
+    parser = create_parser()
+    args = parser.parse_args()
+    demo(args)
