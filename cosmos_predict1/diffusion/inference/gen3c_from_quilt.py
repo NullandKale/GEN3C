@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import time
 from PIL import Image
 from contextlib import contextmanager
+from typing import Tuple
 
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
 from cosmos_predict1.utils import log, misc
@@ -128,7 +129,7 @@ def _extract_quilt_frames(
     return frames
 
 
-# ------------------ NEW: pose/intrinsics/warping utilities ------------------ #
+# ------------------ pose/intrinsics/warping utilities ------------------ #
 
 def _load_meta(sidecar_meta_path: str) -> dict:
     if not os.path.exists(sidecar_meta_path):
@@ -179,7 +180,7 @@ def _center_tile_index(cols: int, rows: int, order: str) -> int:
 
 
 def _lkg_w2c_list(cols: int, rows: int, fov_deg: float, viewcone_deg: float, camera_size: float, invert_quilt: bool, order: str) -> np.ndarray:
-    # Distance and lateral offset as in your LKGCamera
+    # Distance and lateral offset
     cam_dist = camera_size / max(math.tan(math.radians(fov_deg)), 1e-8)
     cam_off = cam_dist * math.tan(math.radians(viewcone_deg))
     rc_order = _tile_order_indices(cols, rows, order)
@@ -191,7 +192,7 @@ def _lkg_w2c_list(cols: int, rows: int, fov_deg: float, viewcone_deg: float, cam
         vfc = vnorm - 0.5
         offset = -(vfc) * cam_off
 
-        # Basis (same sign conventions you used)
+        # Basis
         s = np.array([1, 0, 0], dtype=np.float32)
         u = np.array([0, -1 if invert_quilt else 1, 0], dtype=np.float32)
         f = np.array([0, 0, 1], dtype=np.float32)
@@ -288,6 +289,10 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--gap_x", type=int, default=0, help="Horizontal gap between tiles.")
     p.add_argument("--gap_y", type=int, default=0, help="Vertical gap between tiles.")
 
+    # Sidecars (NEW: optional explicit paths; if omitted, auto-derive from quilt basename)
+    p.add_argument("--meta_json", type=str, default=None, help="Optional path to quilt meta JSON sidecar (.meta.json).")
+    p.add_argument("--center_depth_path", type=str, default=None, help="Optional path to center depth PNG16 sidecar (_center_depth.png).")
+
     # Output / model
     p.add_argument("--checkpoint_dir", type=str, required=True, help="Path to gen3c checkpoint directory (contains Gen3C-Cosmos-7B).")
     p.add_argument("--video_save_folder", type=str, default="outputs", help="Folder for generated outputs.")
@@ -316,6 +321,10 @@ def create_parser() -> argparse.ArgumentParser:
     # Depth mapping (center depth 1.0=NEAR)
     p.add_argument("--depth_near_m", type=float, default=0.3, help="Near (meters) to map center depth.")
     p.add_argument("--depth_far_m", type=float, default=3.0, help="Far (meters) to map center depth.")
+
+    # Optional: save a small run manifest JSON
+    p.add_argument("--save_run_manifest", action="store_true", help="If set, write a JSON manifest next to the output MP4.")
+    p.add_argument("--run_manifest_name", type=str, default=None, help="Optional manifest filename (defaults to <video_save_name>.manifest.json).")
     return p
 
 
@@ -327,6 +336,13 @@ def _resolve_grid_args(quilt_path: str, cols: int, rows: int) -> tuple[int, int]
         raise ValueError("grid_cols/grid_rows not provided and filename does not encode _qs{C}x{R}.")
     log.info(f"Parsed grid from filename: cols={c2}, rows={r2}")
     return c2, r2
+
+
+def _derive_sidecar_paths(quilt_path: str) -> Tuple[str, str]:
+    base, _ext = os.path.splitext(quilt_path)
+    meta_path = base + ".meta.json"
+    depth_path = base + "_center_depth.png"
+    return meta_path, depth_path
 
 
 def demo(args: argparse.Namespace) -> None:
@@ -359,9 +375,13 @@ def demo(args: argparse.Namespace) -> None:
     frames_rgb = [cv2.resize(f, (args.width, args.height), interpolation=cv2.INTER_AREA) for f in frames_rgb]
 
     # --- sidecars (meta + center depth) ---
-    base, _ext = os.path.splitext(args.quilt_path)
-    meta_path = base + ".meta.json"
-    depth_path = base + "_center_depth.png"
+    # Prefer explicit paths if given; otherwise derive from quilt basename.
+    meta_path_auto, depth_path_auto = _derive_sidecar_paths(args.quilt_path)
+    meta_path = args.meta_json or meta_path_auto
+    depth_path = args.center_depth_path or depth_path_auto
+
+    log.info(f"Using meta sidecar: {meta_path}")
+    log.info(f"Using center depth sidecar: {depth_path}")
 
     meta = _load_meta(meta_path)
     fov_deg: float = float(meta["fov_deg"])
@@ -372,6 +392,8 @@ def demo(args: argparse.Namespace) -> None:
 
     # center tile index and seed color
     center_idx = _center_tile_index(cols, rows, order_from_meta)
+    if center_idx < 0 or center_idx >= len(frames_rgb):
+        raise ValueError(f"Computed center index {center_idx} out of range for {len(frames_rgb)} frames.")
     center_rgb = frames_rgb[center_idx]  # HxWx3 (uint8)
 
     # load center depth (16-bit PNG, 1.0 = NEAR) and map to meters
@@ -381,7 +403,9 @@ def demo(args: argparse.Namespace) -> None:
             f"Expected alongside the quilt. Generate it in the quilt renderer."
         )
     depth_u16 = np.array(Image.open(depth_path), dtype=np.uint16)
-    depth01   = depth_u16.astype(np.float32) / 65535.0
+    if depth_u16.ndim == 3:  # tolerate accidental RGB16 saves
+        depth_u16 = depth_u16[..., 0]
+    depth01 = depth_u16.astype(np.float32) / 65535.0
     if depth01.shape != (args.height, args.width):
         depth01 = cv2.resize(depth01, (args.width, args.height), interpolation=cv2.INTER_AREA)
     depth_m = _depth01_to_meters(depth01, near_m=args.depth_near_m, far_m=args.depth_far_m)
@@ -521,6 +545,52 @@ def demo(args: argparse.Namespace) -> None:
     with _timed("Save output video"):
         save_video(video=video_array, fps=args.fps, H=args.height, W=args.width, video_save_quality=5, video_save_path=out_path)
     log.info(f"Saved video to {out_path}")
+
+    # Optional manifest
+    if args.save_run_manifest:
+        manifest = {
+            "input": {
+                "quilt_path": os.path.abspath(args.quilt_path),
+                "meta_json": os.path.abspath(meta_path),
+                "center_depth_path": os.path.abspath(depth_path),
+                "cols": cols,
+                "rows": rows,
+                "order": args.order,
+            },
+            "meta": {
+                "fov_deg": fov_deg,
+                "viewcone_deg": viewcone_deg,
+                "camera_size": camera_size,
+                "invert_quilt": invert_quilt,
+                "order_from_meta": order_from_meta,
+            },
+            "model": {
+                "height": args.height,
+                "width": args.width,
+                "fps": args.fps,
+                "guidance": args.guidance,
+                "num_steps": args.num_steps,
+                "seed": args.seed,
+                "chunk_size": sample_n_frames,
+                "frames_in": T,
+            },
+            "output": {
+                "video_path": os.path.abspath(out_path),
+                "conditioning_video": (os.path.abspath(os.path.join(args.video_save_folder, args.conditioning_video_name))
+                                       if args.save_conditioning_video else None),
+            },
+            "device": str(device),
+            "time_sec_total": float(time.perf_counter() - t_total_start),
+        }
+        man_name = args.run_manifest_name or f"{args.video_save_name}.manifest.json"
+        man_path = os.path.join(args.video_save_folder, man_name)
+        try:
+            with open(man_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            log.info(f"Wrote run manifest: {man_path}")
+        except Exception as e:
+            log.exception(f"Failed to write run manifest: {e}")
+
     log.info(f"Overall elapsed: {(time.perf_counter() - t_total_start):.3f}s")
 
 
