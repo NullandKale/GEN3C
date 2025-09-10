@@ -163,7 +163,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--video_save_name", type=str, default="gen3c_from_quilt", help="Base name for the output MP4.")
     p.add_argument("--height", type=int, default=576, help="Target H for generation and conditioning frames.")
     p.add_argument("--width", type=int, default=1024, help="Target W for generation and conditioning frames.")
-    p.add_argument("--fps", type:int, default=24, help="FPS for output video.")
+    p.add_argument("--fps", type=int, default=24, help="FPS for output video.")
     p.add_argument("--guidance", type=float, default=1.0, help="CFG guidance.")
     p.add_argument("--num_steps", type=int, default=25, help="Diffusion steps.")
     p.add_argument("--seed", type=int, default=1234, help="Random seed.")
