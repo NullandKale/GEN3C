@@ -53,15 +53,15 @@ def _frames_to_b1tchw_minus1_1(frames_rgb_uint8: list[np.ndarray], height: int, 
         if f.shape[0] != height or f.shape[1] != width:
             f = cv2.resize(f, (width, height), interpolation=cv2.INTER_AREA)
         t = torch.from_numpy(f).to(device=device, dtype=torch.float32) / 255.0
-        t = t.permute(2, 0, 1)
+        t = t.permute(2, 0, 1)  # C,H,W
         outs.append(t)
     T = len(outs)
     if T == 0:
         raise ValueError("No frames extracted from quilt.")
-    stack = torch.stack(outs, dim=0)
-    stack = stack.unsqueeze(0)
-    stack = stack * 2.0 - 1.0
-    return stack
+    stack = torch.stack(outs, dim=0)   # T,C,H,W
+    stack = stack.unsqueeze(0)         # 1,T,C,H,W
+    stack = stack * 2.0 - 1.0          # [-1,1]
+    return stack                        # B=1
 
 def _ones_masks_like_images_b1tchw(imgs_b1tchw: torch.Tensor) -> torch.Tensor:
     B, T, C, H, W = imgs_b1tchw.shape
@@ -92,6 +92,7 @@ def _extract_quilt_frames(
     if img_bgr is None:
         raise FileNotFoundError(f"Quilt image not found: {quilt_path}")
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
     H, W = img_rgb.shape[:2]
     work_w = W - left - right
     work_h = H - top - bottom
@@ -99,6 +100,7 @@ def _extract_quilt_frames(
         raise ValueError(f"Invalid crop margins; got work area {work_w}x{work_h}.")
     if grid_cols <= 0 or grid_rows <= 0:
         raise ValueError("grid_cols and grid_rows must be positive.")
+
     if grid_cols == 1:
         tile_w = work_w
     else:
@@ -109,8 +111,10 @@ def _extract_quilt_frames(
         tile_h = (work_h - (grid_rows - 1) * gap_y) // grid_rows
     if tile_w <= 0 or tile_h <= 0:
         raise ValueError(f"Computed non-positive tile size {tile_w}x{tile_h}. Check gaps/margins.")
+
     idxs = []
     if order == "quilt":
+        # bottom-left origin → fill rows from bottom to top, cols left to right
         for r in range(grid_rows - 1, -1, -1):
             for c in range(grid_cols):
                 idxs.append((r, c))
@@ -124,9 +128,11 @@ def _extract_quilt_frames(
                 idxs.append((r, c))
     else:
         raise ValueError("order must be 'quilt', 'row-major', or 'col-major'.")
+
     max_frames = grid_cols * grid_rows
     T = total_frames if total_frames is not None else max_frames
     T = max(0, min(T, max_frames))
+
     frames = []
     for k, (r, c) in enumerate(idxs):
         if k >= T:
@@ -157,7 +163,7 @@ def create_parser() -> argparse.ArgumentParser:
     p.add_argument("--video_save_name", type=str, default="gen3c_from_quilt", help="Base name for the output MP4.")
     p.add_argument("--height", type=int, default=576, help="Target H for generation and conditioning frames.")
     p.add_argument("--width", type=int, default=1024, help="Target W for generation and conditioning frames.")
-    p.add_argument("--fps", type=int, default=24, help="FPS for output video.")
+    p.add_argument("--fps", type:int, default=24, help="FPS for output video.")
     p.add_argument("--guidance", type=float, default=1.0, help="CFG guidance.")
     p.add_argument("--num_steps", type=int, default=25, help="Diffusion steps.")
     p.add_argument("--seed", type=int, default=1234, help="Random seed.")
@@ -212,10 +218,18 @@ def demo(args: argparse.Namespace) -> None:
         log.info(f"Extracted {len(frames_rgb)} frames from quilt (order={args.order}, cols={cols}, rows={rows}).")
 
     with _timed("Build conditioning tensor"):
+        # Images: B, T, C, H, W in [-1,1]
         cond_b1tchw = _frames_to_b1tchw_minus1_1(frames_rgb, args.height, args.width, device)
+        # Masks:  B, T, 1, H, W
         masks_b1t1hw = _ones_masks_like_images_b1tchw(cond_b1tchw)
+
+        # Expand to 6D (B, T, N, C, H, W) and (B, T, N, 1, H, W) with N=1 for compatibility.
+        cond_b1tnchw = cond_b1tchw.unsqueeze(2)
+        masks_b1tN1hw = masks_b1t1hw.unsqueeze(2)
+
         B, T, C, H, W = cond_b1tchw.shape
-        log.info(f"Conditioning tensor shape: {tuple(cond_b1tchw.shape)}; masks: {tuple(masks_b1t1hw.shape)}")
+        log.info(f"Conditioning (B,T,C,H,W): {tuple(cond_b1tchw.shape)}; with N-axis: {tuple(cond_b1tnchw.shape)}")
+        log.info(f"Masks       (B,T,1,H,W): {tuple(masks_b1t1hw.shape)}; with N-axis: {tuple(masks_b1tN1hw.shape)}")
 
     with _timed("Init Gen3cPipeline"):
         pipeline = Gen3cPipeline(
@@ -244,11 +258,17 @@ def demo(args: argparse.Namespace) -> None:
     log.info(f"Model chunk_size={sample_n_frames}, input_frames={T}")
 
     if args.strict_exact_length and T != sample_n_frames:
-        raise ValueError(f"Input quilt has {T} frames but model chunk_size is {sample_n_frames}. To mirror the single-image script, provide a quilt with cols*rows=={sample_n_frames} (e.g., _qs11x11...).")
+        raise ValueError(
+            f"Input quilt has {T} frames but model chunk_size is {sample_n_frames}. "
+            f"To mirror the single-image script, provide a quilt with cols*rows=={sample_n_frames} (e.g., _qs11x11...)."
+        )
 
     if args.save_conditioning_video:
         try:
-            cond_NHWC = ((cond_b1tchw[0].permute(0, 2, 3, 1).float() * 0.5 + 0.5) * 255.0).clamp(0, 255).byte().cpu().numpy()
+            cond_NHWC = (
+                (cond_b1tchw[0].permute(0, 2, 3, 1).float() * 0.5 + 0.5)
+                * 255.0
+            ).clamp(0, 255).byte().cpu().numpy()
             cond_path = os.path.join(args.video_save_folder, args.conditioning_video_name)
             with _timed("Save conditioning video"):
                 save_video(video=cond_NHWC, fps=args.fps, H=args.height, W=args.width, video_save_quality=5, video_save_path=cond_path)
@@ -259,42 +279,76 @@ def demo(args: argparse.Namespace) -> None:
     video_out_list = []
     with _timed("Generate"):
         if T <= sample_n_frames:
-            imgs = cond_b1tchw[:, :T]
-            masks = masks_b1t1hw[:, :T]
-            img0_bcthw = imgs[:, 0:1].permute(0, 2, 1, 3, 4)
-            generated = pipeline.generate(prompt=args.prompt or "", image_path=img0_bcthw, negative_prompt=args.negative_prompt, rendered_warp_images=imgs, rendered_warp_masks=masks)
+            # 5D views for seed frame; 6D for rendered warps (N=1)
+            imgs5 = cond_b1tchw[:, :T]       # B,T,C,H,W
+            masks5 = masks_b1t1hw[:, :T]     # B,T,1,H,W
+            imgs6 = cond_b1tnchw[:, :T]      # B,T,N,C,H,W
+            masks6 = masks_b1tN1hw[:, :T]    # B,T,N,1,H,W
+
+            # Seed frame expects B,C,T,H,W (BCTHW) with T=1
+            img0_bcthw = imgs5[:, 0:1].permute(0, 2, 1, 3, 4)
+
+            # Call model with 6D warped tensors
+            generated = pipeline.generate(
+                prompt=args.prompt or "",
+                image_path=img0_bcthw,
+                negative_prompt=args.negative_prompt,
+                rendered_warp_images=imgs6,
+                rendered_warp_masks=masks6
+            )
             if generated is None:
                 log.critical("Guardrail blocked generation; aborting.")
                 raise RuntimeError("Generation blocked by guardrail.")
             video_chunk, prompt_text = generated
             video_out_list.append(video_chunk)
         else:
+            # Chunked path with overlap of 1 frame
             start = 0
             last_seed_frame_bcthw = None
             while start < T:
                 end = min(start + sample_n_frames, T)
-                chunk_imgs = cond_b1tchw[:, start:end]
-                chunk_masks = masks_b1t1hw[:, start:end]
+
+                # 6D warps for this chunk
+                chunk_imgs6 = cond_b1tnchw[:, start:end]   # B, t, N, C, H, W
+                chunk_masks6 = masks_b1tN1hw[:, start:end] # B, t, N, 1, H, W
+
+                # Seed frame in BCTHW (T=1)
                 if last_seed_frame_bcthw is None:
-                    img0_bcthw = chunk_imgs[:, 0:1].permute(0, 2, 1, 3, 4)
+                    # derive from 5D stack
+                    chunk_imgs5 = cond_b1tchw[:, start:end]
+                    img0_bcthw = chunk_imgs5[:, 0:1].permute(0, 2, 1, 3, 4)
                 else:
                     img0_bcthw = last_seed_frame_bcthw
-                generated = pipeline.generate(prompt=args.prompt or "", image_path=img0_bcthw, negative_prompt=args.negative_prompt, rendered_warp_images=chunk_imgs, rendered_warp_masks=chunk_masks)
+
+                generated = pipeline.generate(
+                    prompt=args.prompt or "",
+                    image_path=img0_bcthw,
+                    negative_prompt=args.negative_prompt,
+                    rendered_warp_images=chunk_imgs6,
+                    rendered_warp_masks=chunk_masks6
+                )
                 if generated is None:
                     log.critical("Guardrail blocked generation; aborting this item.")
                     break
                 video_chunk, prompt_text = generated
+
                 if start == 0:
                     video_out_list.append(video_chunk)
                 else:
+                    # Drop the first frame to avoid duplication across chunks
                     video_out_list.append(video_chunk[1:])
+
+                # Prepare next seed (last output frame → BCTHW with T=1 in [-1,1])
                 last_frame = torch.from_numpy(video_chunk[-1]).to(device=device, dtype=torch.float32) / 255.0
                 last_chw = last_frame.permute(2, 0, 1)
-                last_seed_frame_bcthw = (last_chw.unsqueeze(0).unsqueeze(2) * 2.0 - 1.0)
+                last_seed_frame_bcthw = (last_chw.unsqueeze(0).unsqueeze(2) * 2.0 - 1.0)  # B,C,T=1,H,W
+
+                # Overlap by one frame
                 start = end - 1
 
     if not video_out_list:
         raise RuntimeError("No output frames produced.")
+
     video_array = np.concatenate(video_out_list, axis=0)
     out_path = os.path.join(args.video_save_folder, f"{args.video_save_name}.mp4")
     with _timed("Save output video"):
